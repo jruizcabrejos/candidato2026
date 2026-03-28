@@ -24,8 +24,7 @@ FIRST_NAME_LOOKUP_CSV <- file.path("data", "reference", "first_name_sex.csv")
 SEX_OVERRIDE_CSV <- file.path("data", "manual", "sex_overrides.csv")
 
 BLEND_MODES <- c("filtered", "all_faces")
-GROUP_MODES <- c("all", "sex", "region", "affiliation", "region_affiliation")
-LEGACY_ALIAS_GROUP_MODES <- c("region", "affiliation", "region_affiliation")
+GROUP_MODES <- c("all", "sex", "region", "region_sex", "affiliation", "region_affiliation")
 
 MIN_VALID_IMAGES <- 3L
 TARGET_WIDTH <- 427L
@@ -1135,6 +1134,7 @@ group_mode_fields <- function(group_mode) {
     all = character(),
     sex = c("sex_assigned"),
     region = c("region_slug"),
+    region_sex = c("region_slug", "sex_assigned"),
     affiliation = c("affiliation_slug"),
     region_affiliation = c("region_slug", "affiliation_slug"),
     stop("Unsupported grouping mode: ", group_mode, call. = FALSE)
@@ -1177,6 +1177,13 @@ build_group_paths <- function(blend_mode, group_mode, region_slug = NA_character
     ))
   }
 
+  if (identical(group_mode, "region_sex")) {
+    return(list(
+      output_path = file.path(root_dir, "by_region_sex", region_slug, paste0(sex_assigned, ".jpg")),
+      qc_path = file.path(root_dir, "qc", "by_region_sex", region_slug, paste0(sex_assigned, ".jpg"))
+    ))
+  }
+
   if (identical(group_mode, "affiliation")) {
     return(list(
       output_path = file.path(root_dir, "by_affiliation", paste0(affiliation_slug, ".jpg")),
@@ -1215,6 +1222,7 @@ build_group_record <- function(group_rows, blend_mode, group_mode) {
     all = "all",
     sex = sex_assigned,
     region = region_slug,
+    region_sex = paste(region_slug, sex_assigned, sep = "__"),
     affiliation = affiliation_slug,
     region_affiliation = paste(region_slug, affiliation_slug, sep = "__")
   )
@@ -1224,6 +1232,7 @@ build_group_record <- function(group_rows, blend_mode, group_mode) {
     all = "All Candidates",
     sex = sex_display_label(sex_assigned),
     region = region_label,
+    region_sex = paste(region_label, sex_display_label(sex_assigned), sep = " / "),
     affiliation = affiliation_label,
     region_affiliation = paste(region_label, affiliation_label, sep = " / ")
   )
@@ -1246,6 +1255,7 @@ reset_generated_output_dirs <- function() {
     FILTERED_ROOT,
     ALL_FACES_ROOT,
     MANIFEST_ROOT,
+    # Remove compatibility folders from earlier runs and do not recreate them.
     file.path(OUTPUT_ROOT, "by_region"),
     file.path(OUTPUT_ROOT, "by_affiliation"),
     file.path(OUTPUT_ROOT, "by_region_affiliation"),
@@ -1268,30 +1278,27 @@ ensure_average_face_dirs <- function() {
     ALL_FACES_ROOT,
     MANIFEST_ROOT,
     file.path(FILTERED_ROOT, "by_region"),
+    file.path(FILTERED_ROOT, "by_region_sex"),
     file.path(FILTERED_ROOT, "by_affiliation"),
     file.path(FILTERED_ROOT, "by_region_affiliation"),
     file.path(FILTERED_ROOT, "by_sex"),
     file.path(FILTERED_ROOT, "qc"),
     file.path(FILTERED_ROOT, "qc", "by_region"),
+    file.path(FILTERED_ROOT, "qc", "by_region_sex"),
     file.path(FILTERED_ROOT, "qc", "by_affiliation"),
     file.path(FILTERED_ROOT, "qc", "by_region_affiliation"),
     file.path(FILTERED_ROOT, "qc", "by_sex"),
     file.path(ALL_FACES_ROOT, "by_region"),
+    file.path(ALL_FACES_ROOT, "by_region_sex"),
     file.path(ALL_FACES_ROOT, "by_affiliation"),
     file.path(ALL_FACES_ROOT, "by_region_affiliation"),
     file.path(ALL_FACES_ROOT, "by_sex"),
     file.path(ALL_FACES_ROOT, "qc"),
     file.path(ALL_FACES_ROOT, "qc", "by_region"),
+    file.path(ALL_FACES_ROOT, "qc", "by_region_sex"),
     file.path(ALL_FACES_ROOT, "qc", "by_affiliation"),
     file.path(ALL_FACES_ROOT, "qc", "by_region_affiliation"),
     file.path(ALL_FACES_ROOT, "qc", "by_sex"),
-    file.path(OUTPUT_ROOT, "by_region"),
-    file.path(OUTPUT_ROOT, "by_affiliation"),
-    file.path(OUTPUT_ROOT, "by_region_affiliation"),
-    file.path(OUTPUT_ROOT, "qc"),
-    file.path(OUTPUT_ROOT, "qc", "by_region"),
-    file.path(OUTPUT_ROOT, "qc", "by_affiliation"),
-    file.path(OUTPUT_ROOT, "qc", "by_region_affiliation"),
     file.path("data", "reference"),
     file.path("data", "manual")
   )
@@ -1465,72 +1472,6 @@ build_group_manifest <- function(image_manifest) {
   }
 
   dplyr::bind_rows(group_manifest_rows)
-}
-
-legacy_alias_paths <- function(group_mode, region_slug = NA_character_, affiliation_slug = NA_character_) {
-  if (identical(group_mode, "region")) {
-    return(list(
-      output_path = file.path(OUTPUT_ROOT, "by_region", paste0(region_slug, ".jpg")),
-      qc_path = file.path(OUTPUT_ROOT, "qc", "by_region", paste0(region_slug, ".jpg"))
-    ))
-  }
-
-  if (identical(group_mode, "affiliation")) {
-    return(list(
-      output_path = file.path(OUTPUT_ROOT, "by_affiliation", paste0(affiliation_slug, ".jpg")),
-      qc_path = file.path(OUTPUT_ROOT, "qc", "by_affiliation", paste0(affiliation_slug, ".jpg"))
-    ))
-  }
-
-  list(
-    output_path = file.path(
-      OUTPUT_ROOT,
-      "by_region_affiliation",
-      region_slug,
-      paste0(affiliation_slug, ".jpg")
-    ),
-    qc_path = file.path(
-      OUTPUT_ROOT,
-      "qc",
-      "by_region_affiliation",
-      region_slug,
-      paste0(affiliation_slug, ".jpg")
-    )
-  )
-}
-
-sync_legacy_filtered_aliases <- function(group_manifest) {
-  alias_rows <- group_manifest %>%
-    dplyr::filter(
-      .data$blend_mode == "filtered",
-      .data$group_mode %in% LEGACY_ALIAS_GROUP_MODES,
-      .data$rendered
-    )
-
-  for (row_idx in seq_len(nrow(alias_rows))) {
-    alias_row <- alias_rows[row_idx, , drop = FALSE]
-    alias_paths <- legacy_alias_paths(
-      row_value_or_na(alias_row, "group_mode"),
-      row_value_or_na(alias_row, "region_slug"),
-      row_value_or_na(alias_row, "affiliation_slug")
-    )
-
-    dir.create(dirname(alias_paths$output_path), recursive = TRUE, showWarnings = FALSE)
-    file.copy(
-      from = row_value_or_na(alias_row, "output_path"),
-      to = alias_paths$output_path,
-      overwrite = TRUE
-    )
-
-    qc_output_path <- row_value_or_na(alias_row, "qc_output_path")
-
-    if (!is.na(qc_output_path) && file.exists(qc_output_path)) {
-      dir.create(dirname(alias_paths$qc_path), recursive = TRUE, showWarnings = FALSE)
-      file.copy(from = qc_output_path, to = alias_paths$qc_path, overwrite = TRUE)
-    }
-  }
-
-  invisible(alias_rows)
 }
 
 format_example_values <- function(df, eligibility_col, retained = TRUE, max_examples = 3L) {
@@ -1730,10 +1671,6 @@ skipped_images <- if (length(issue_rows) > 0) {
 
 group_manifest <- build_group_manifest(processed_manifest) %>%
   dplyr::arrange(.data$blend_mode, .data$group_mode, .data$group_key)
-
-# Keep the legacy alias folders in sync because downstream consumers may still
-# expect the older filtered path layout.
-sync_legacy_filtered_aliases(group_manifest)
 
 
 # =======================================
