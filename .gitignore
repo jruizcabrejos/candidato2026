@@ -1,0 +1,25 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Renviron
+
+# Local package library
+r_libs/
+
+# Local tools
+tools/pandoc-*/
+
+# Raw and generated artifacts
+data/raw/
+output/
+logs/
+tmp/
+tmp_*/
+tmp-*/
+
+# OS files
+.DS_Store
+Thumbs.db
+README_internal.md

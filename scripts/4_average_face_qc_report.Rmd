@@ -1,0 +1,147 @@
+---
+title: "Peru 2026 Election Portrait QC Report"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+params:
+  output_root: "output/average_faces"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(readr)
+library(dplyr)
+library(stringr)
+library(knitr)
+
+resolve_report_path <- function(path) {
+  # Allow the report to be rendered either from the repository root or from the
+  # scripts directory without changing the parameter value.
+  candidates <- c(path, file.path("..", path))
+  existing <- candidates[file.exists(candidates) | dir.exists(candidates)]
+
+  if (length(existing) == 0) {
+    stop("Could not resolve report path: ", path, call. = FALSE)
+  }
+
+  normalizePath(existing[[1]], winslash = "/", mustWork = TRUE)
+}
+
+output_root <- resolve_report_path(params$output_root)
+manifest_root <- file.path(output_root, "manifests")
+
+image_manifest <- read_csv(file.path(manifest_root, "image_manifest.csv"), show_col_types = FALSE)
+group_manifest <- read_csv(file.path(manifest_root, "group_manifest.csv"), show_col_types = FALSE)
+sex_manifest <- read_csv(file.path(manifest_root, "sex_assignment_manifest.csv"), show_col_types = FALSE)
+review_queue <- read_csv(file.path(manifest_root, "sex_review_queue.csv"), show_col_types = FALSE)
+party_summary <- read_csv(file.path(manifest_root, "exclusion_summary_by_party.csv"), show_col_types = FALSE)
+department_summary <- read_csv(file.path(manifest_root, "exclusion_summary_by_department.csv"), show_col_types = FALSE)
+
+portrait_candidates <- image_manifest %>%
+  distinct(id_candidato)
+
+sex_manifest_portraits <- sex_manifest %>%
+  semi_join(portrait_candidates, by = "id_candidato")
+
+safe_image <- function(path) {
+  if (!is.na(path) && file.exists(path)) {
+    knitr::include_graphics(normalizePath(path, winslash = "/"))
+  } else {
+    "Not rendered"
+  }
+}
+```
+
+## Snapshot
+
+```{r}
+snapshot <- tibble(
+  metric = c(
+    "Discovered portraits",
+    "Readable portraits (all_faces)",
+    "Retained portraits (filtered)",
+    "Distinct portrait candidates",
+    "Rendered groups",
+    "Skipped groups"
+  ),
+  value = c(
+    nrow(image_manifest),
+    sum(image_manifest$eligible_all == "TRUE", na.rm = TRUE),
+    sum(image_manifest$eligible_filtered == "TRUE", na.rm = TRUE),
+    n_distinct(image_manifest$id_candidato),
+    sum(group_manifest$rendered == "TRUE", na.rm = TRUE),
+    sum(group_manifest$rendered != "TRUE", na.rm = TRUE)
+  )
+)
+
+kable(snapshot)
+```
+
+## Sex Assignment
+
+```{r}
+sex_sources <- sex_manifest_portraits %>%
+  count(sex_source, sex_confidence, needs_manual_review, sort = TRUE)
+
+kable(sex_sources)
+```
+
+```{r}
+sex_breakdown <- image_manifest %>%
+  distinct(id_candidato, sex_assigned) %>%
+  count(sex_assigned, sort = TRUE)
+
+kable(sex_breakdown)
+```
+
+## Global Outputs
+
+### Filtered
+
+```{r out.width='32%', fig.show='hold'}
+safe_image(file.path(output_root, "filtered", "all.jpg"))
+safe_image(file.path(output_root, "filtered", "by_sex", "female.jpg"))
+safe_image(file.path(output_root, "filtered", "by_sex", "male.jpg"))
+```
+
+### All Faces
+
+```{r out.width='32%', fig.show='hold'}
+safe_image(file.path(output_root, "all_faces", "all.jpg"))
+safe_image(file.path(output_root, "all_faces", "by_sex", "female.jpg"))
+safe_image(file.path(output_root, "all_faces", "by_sex", "male.jpg"))
+```
+
+## Groups
+
+```{r}
+group_counts <- group_manifest %>%
+  count(blend_mode, group_mode, rendered, sort = TRUE)
+
+kable(group_counts)
+```
+
+## Exclusions By Party
+
+```{r}
+kable(party_summary %>% arrange(desc(excluded_filtered), group_label) %>% slice_head(n = 30))
+```
+
+## Exclusions By Department
+
+```{r}
+kable(department_summary %>% arrange(desc(excluded_filtered), group_label))
+```
+
+## Review Queue
+
+```{r}
+if (nrow(review_queue) == 0) {
+  knitr::kable(tibble(status = "No rows currently flagged for manual review."))
+} else {
+  kable(review_queue %>% select(id_candidato, nombre, sex_assigned, sex_source, sex_confidence, preview_image_path))
+}
+```
