@@ -15,7 +15,7 @@ tools/pandoc-*/
 data/raw/
 output/
 backup_output/
-backup_output/
+backup_data/
 logs/
 tmp/
 tmp_*/
