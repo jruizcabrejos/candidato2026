@@ -14,8 +14,6 @@ tools/pandoc-*/
 # Raw and generated artifacts
 data/raw/
 output/
-backup_data/
-backup_output/
 logs/
 tmp/
 tmp_*/
