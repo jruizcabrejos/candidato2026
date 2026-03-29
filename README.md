@@ -17,8 +17,9 @@ Este repositorio contiene un flujo local para recopilar, reconstruir, procesar y
     Lee la información guardada localmente y reconstruye los datos normalizados sin necesidad de internet. Solo recurre al navegador web si necesita recuperar alguna foto faltante.
 *   **Paso 3: Procesamiento de rostros (`scripts/3_average_candidate_faces.R`)**
     Evalúa la calidad de las fotos, asigna etiquetas de sexo basándose en los valores declarados y genera imágenes compuestas de "rostros promedio".
-    
-        - Cada JPG se normaliza: Se detecta el rostro principal con opencv::ocv_facemask(), se recorta alrededor de la cara (o se usa un recorte de respaldo centrado en el retrato, si no hay deteccion), y se reescala a un lienzo comun de 427x602. Luego se calculan metricas simples de calidad (blur, tamano relativo del rostro, centrado, contraste y exposicion). El promedio final se renderiza con magick::image_average() sobre esos retratos ya alineados. Es un promedio 2D por pixeles, no una "fusión" (morph) por landmarks faciales (ojos/nariz/boca/...).
+        - Cada JPG se normaliza:
+                - Se detecta el rostro principal con opencv::ocv_facemask()
+                - Se recorta alrededor de la cara (o se usa un recorte de respaldo centrado en el retrato, si no hay deteccion), y se reescala a un lienzo comun de 427x602. Luego se calculan metricas simples de calidad (blur, tamano relativo del rostro, centrado, contraste y exposicion). El promedio final se renderiza con magick::image_average() sobre esos retratos ya alineados. Es un promedio 2D por pixeles, no una "fusión" (morph) por landmarks faciales (ojos/nariz/boca/...).
         
 *   **Paso 4: Reporte de calidad (`scripts/4_average_face_qc_report.Rmd`)**
     Convierte los manifiestos de control de calidad del paso anterior en un resumen visual en formato HTML para facilitar su revisión.
