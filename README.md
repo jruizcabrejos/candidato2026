@@ -42,8 +42,7 @@ Toda la información se alimenta de datos públicos. Las páginas principales co
 
 ## Notas Clave
 
-- El scraper en vivo debe correrse visible, no headless, usando la configuracion Firefox ya incluida en el proyecto.
-- Las candidaturas exportadas conservan el campo `type`, por ejemplo `Diputado`, `Senador`, `Presidente` y `Vicepresidente`.
+- El scraper esta diseñado para ser usado "en vivo" (no "headless"). Testeado usando la configuracion Firefox ya incluida.
 - Las candidaturas de `presidente-vicepresidentes` y `senadores` usan `Peru` como ambito geografico.
 
 **Aclaración:** Este es un proyecto de procesamiento de datos no oficial construido sobre información electoral pública. No estamos afiliados, respaldados ni mantenidos por el Jurado Nacional de Elecciones (JNE).
