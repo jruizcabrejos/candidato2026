@@ -26,11 +26,19 @@ MANIFEST_PATH <- file.path(MANIFEST_ROOT, "transparent_manifest.csv")
 TARGET_SUBDIRS <- c("filtered", "all_faces")
 
 BACKGROUND_FUZZ <- suppressWarnings(
-  as.numeric(Sys.getenv("JNE_TRANSPARENT_FUZZ", unset = "12"))
+  as.numeric(Sys.getenv("JNE_TRANSPARENT_FUZZ", unset = "18"))
 )
 
 if (length(BACKGROUND_FUZZ) == 0L || is.na(BACKGROUND_FUZZ) || BACKGROUND_FUZZ < 0) {
-  BACKGROUND_FUZZ <- 12
+  BACKGROUND_FUZZ <- 18
+}
+
+BACKGROUND_PREBLUR_SIGMA <- suppressWarnings(
+  as.numeric(Sys.getenv("JNE_TRANSPARENT_PREBLUR_SIGMA", unset = "1.2"))
+)
+
+if (length(BACKGROUND_PREBLUR_SIGMA) == 0L || is.na(BACKGROUND_PREBLUR_SIGMA) || BACKGROUND_PREBLUR_SIGMA < 0) {
+  BACKGROUND_PREBLUR_SIGMA <- 1.2
 }
 
 CROP_PADDING <- suppressWarnings(
@@ -41,12 +49,48 @@ if (length(CROP_PADDING) == 0L || is.na(CROP_PADDING) || CROP_PADDING < 0L) {
   CROP_PADDING <- 6L
 }
 
+CROP_PADDING_RATIO <- suppressWarnings(
+  as.numeric(Sys.getenv("JNE_TRANSPARENT_PADDING_RATIO", unset = "0.12"))
+)
+
+if (length(CROP_PADDING_RATIO) == 0L || is.na(CROP_PADDING_RATIO) || CROP_PADDING_RATIO < 0) {
+  CROP_PADDING_RATIO <- 0.12
+}
+
 ALPHA_THRESHOLD <- suppressWarnings(
   as.integer(Sys.getenv("JNE_TRANSPARENT_ALPHA_THRESHOLD", unset = "8"))
 )
 
 if (length(ALPHA_THRESHOLD) == 0L || is.na(ALPHA_THRESHOLD) || ALPHA_THRESHOLD < 0L) {
   ALPHA_THRESHOLD <- 8L
+}
+
+MASK_BLUR_SIGMA <- suppressWarnings(
+  as.numeric(Sys.getenv("JNE_TRANSPARENT_MASK_BLUR_SIGMA", unset = "2.2"))
+)
+
+if (length(MASK_BLUR_SIGMA) == 0L || is.na(MASK_BLUR_SIGMA) || MASK_BLUR_SIGMA < 0) {
+  MASK_BLUR_SIGMA <- 2.2
+}
+
+MASK_LEVEL_BLACK <- suppressWarnings(
+  as.numeric(Sys.getenv("JNE_TRANSPARENT_MASK_LEVEL_BLACK", unset = "14"))
+)
+
+if (length(MASK_LEVEL_BLACK) == 0L || is.na(MASK_LEVEL_BLACK) || MASK_LEVEL_BLACK < 0 || MASK_LEVEL_BLACK > 100) {
+  MASK_LEVEL_BLACK <- 14
+}
+
+MASK_LEVEL_WHITE <- suppressWarnings(
+  as.numeric(Sys.getenv("JNE_TRANSPARENT_MASK_LEVEL_WHITE", unset = "92"))
+)
+
+if (length(MASK_LEVEL_WHITE) == 0L || is.na(MASK_LEVEL_WHITE) || MASK_LEVEL_WHITE < 0 || MASK_LEVEL_WHITE > 100) {
+  MASK_LEVEL_WHITE <- 92
+}
+
+if (MASK_LEVEL_WHITE <= MASK_LEVEL_BLACK) {
+  MASK_LEVEL_WHITE <- min(100, MASK_LEVEL_BLACK + 10)
 }
 
 OVERWRITE_OUTPUT <- !identical(
@@ -128,6 +172,10 @@ format_fill_point <- function(x, y) {
 edge_fill_points <- function(width, height) {
   x_mid <- max(as.integer(round(width / 2)), 1L)
   y_mid <- max(as.integer(round(height / 2)), 1L)
+  x_quarter <- max(as.integer(round(width / 4)), 1L)
+  x_three_quarter <- max(as.integer(round((width * 3) / 4)), 1L)
+  y_quarter <- max(as.integer(round(height / 4)), 1L)
+  y_three_quarter <- max(as.integer(round((height * 3) / 4)), 1L)
 
   coords <- unique(
     rbind(
@@ -138,22 +186,160 @@ edge_fill_points <- function(width, height) {
       c(x_mid, 1L),
       c(x_mid, height),
       c(1L, y_mid),
-      c(width, y_mid)
+      c(width, y_mid),
+      c(x_quarter, 1L),
+      c(x_three_quarter, 1L),
+      c(x_quarter, height),
+      c(x_three_quarter, height),
+      c(1L, y_quarter),
+      c(1L, y_three_quarter),
+      c(width, y_quarter),
+      c(width, y_three_quarter)
     )
   )
 
   apply(coords, 1, function(row_value) format_fill_point(row_value[[1]], row_value[[2]]))
 }
 
-alpha_bbox <- function(image, alpha_threshold = 8L, padding = 6L) {
+alpha_matrix_from_image <- function(image) {
   rgba_data <- magick::image_data(image, channels = "rgba")
   alpha_values <- as.integer(strtoi(as.vector(rgba_data[4, , ]), 16L))
-  alpha_matrix <- matrix(
+  matrix(
     alpha_values,
     nrow = dim(rgba_data)[2],
     ncol = dim(rgba_data)[3]
   )
+}
 
+alpha_matrix_to_mask_image <- function(alpha_matrix) {
+  alpha_matrix <- round(alpha_matrix)
+  alpha_matrix[alpha_matrix < 0] <- 0
+  alpha_matrix[alpha_matrix > 255] <- 255
+  alpha_values <- t(alpha_matrix) / 255
+  mask_colors <- grDevices::rgb(alpha_values, alpha_values, alpha_values)
+  dim(mask_colors) <- dim(alpha_values)
+
+  magick::image_read(as.raster(mask_colors))
+}
+
+gray_matrix_from_image <- function(image) {
+  gray_data <- magick::image_data(
+    magick::image_convert(image, colorspace = "gray"),
+    channels = "gray"
+  )
+  gray_values <- as.integer(strtoi(as.vector(gray_data[1, , ]), 16L))
+
+  matrix(
+    gray_values,
+    nrow = dim(gray_data)[2],
+    ncol = dim(gray_data)[3]
+  )
+}
+
+rgb_matrices_from_image <- function(image) {
+  rgb_data <- magick::image_data(image, channels = "rgb")
+
+  list(
+    red = matrix(
+      as.integer(strtoi(as.vector(rgb_data[1, , ]), 16L)),
+      nrow = dim(rgb_data)[2],
+      ncol = dim(rgb_data)[3]
+    ),
+    green = matrix(
+      as.integer(strtoi(as.vector(rgb_data[2, , ]), 16L)),
+      nrow = dim(rgb_data)[2],
+      ncol = dim(rgb_data)[3]
+    ),
+    blue = matrix(
+      as.integer(strtoi(as.vector(rgb_data[3, , ]), 16L)),
+      nrow = dim(rgb_data)[2],
+      ncol = dim(rgb_data)[3]
+    )
+  )
+}
+
+rgba_image_from_source_and_alpha <- function(source_image, alpha_matrix) {
+  rgb_matrices <- rgb_matrices_from_image(source_image)
+  rgba_colors <- grDevices::rgb(
+    t(rgb_matrices$red) / 255,
+    t(rgb_matrices$green) / 255,
+    t(rgb_matrices$blue) / 255,
+    alpha = t(alpha_matrix) / 255
+  )
+
+  dim(rgba_colors) <- c(ncol(alpha_matrix), nrow(alpha_matrix))
+
+  magick::image_read(as.raster(rgba_colors))
+}
+
+build_smoothed_alpha_matrix <- function(image, alpha_threshold = 8L) {
+  alpha_matrix <- alpha_matrix_from_image(image)
+  alpha_matrix[alpha_matrix <= alpha_threshold] <- 0L
+
+  if (!any(alpha_matrix > 0L)) {
+    return(NULL)
+  }
+
+  alpha_mask <- alpha_matrix_to_mask_image(alpha_matrix)
+  alpha_mask <- magick::image_convert(alpha_mask, colorspace = "gray")
+
+  if (MASK_BLUR_SIGMA > 0) {
+    alpha_mask <- magick::image_blur(alpha_mask, radius = 0, sigma = MASK_BLUR_SIGMA)
+  }
+
+  alpha_mask <- magick::image_level(
+    alpha_mask,
+    black_point = MASK_LEVEL_BLACK,
+    white_point = MASK_LEVEL_WHITE
+  )
+
+  gray_matrix_from_image(alpha_mask)
+}
+
+expand_bbox_to_aspect <- function(bbox, canvas_width, canvas_height, target_aspect) {
+  bbox_width <- bbox$x_max - bbox$x_min + 1L
+  bbox_height <- bbox$y_max - bbox$y_min + 1L
+
+  if (is.na(target_aspect) || target_aspect <= 0) {
+    return(bbox)
+  }
+
+  current_aspect <- bbox_height / bbox_width
+
+  if (current_aspect < target_aspect) {
+    target_height <- min(canvas_height, as.integer(ceiling(bbox_width * target_aspect)))
+    extra <- max(target_height - bbox_height, 0L)
+    add_top <- extra %/% 2L
+    add_bottom <- extra - add_top
+
+    bbox$y_min <- max(bbox$y_min - add_top, 1L)
+    bbox$y_max <- min(bbox$y_max + add_bottom, canvas_height)
+
+    remaining <- target_height - (bbox$y_max - bbox$y_min + 1L)
+    if (remaining > 0L) {
+      bbox$y_min <- max(bbox$y_min - remaining, 1L)
+      bbox$y_max <- min(bbox$y_min + target_height - 1L, canvas_height)
+    }
+  } else if (current_aspect > target_aspect) {
+    target_width <- min(canvas_width, as.integer(ceiling(bbox_height / target_aspect)))
+    extra <- max(target_width - bbox_width, 0L)
+    add_left <- extra %/% 2L
+    add_right <- extra - add_left
+
+    bbox$x_min <- max(bbox$x_min - add_left, 1L)
+    bbox$x_max <- min(bbox$x_max + add_right, canvas_width)
+
+    remaining <- target_width - (bbox$x_max - bbox$x_min + 1L)
+    if (remaining > 0L) {
+      bbox$x_min <- max(bbox$x_min - remaining, 1L)
+      bbox$x_max <- min(bbox$x_min + target_width - 1L, canvas_width)
+    }
+  }
+
+  bbox
+}
+
+alpha_bbox <- function(alpha_matrix, alpha_threshold = 8L, padding = 6L, target_aspect = NA_real_) {
   keep_x <- which(rowSums(alpha_matrix > alpha_threshold) > 0)
   keep_y <- which(colSums(alpha_matrix > alpha_threshold) > 0)
 
@@ -161,14 +347,25 @@ alpha_bbox <- function(image, alpha_threshold = 8L, padding = 6L) {
     return(NULL)
   }
 
-  width <- dim(rgba_data)[2]
-  height <- dim(rgba_data)[3]
+  width <- nrow(alpha_matrix)
+  height <- ncol(alpha_matrix)
+  subject_width <- max(keep_x) - min(keep_x) + 1L
+  subject_height <- max(keep_y) - min(keep_y) + 1L
+  effective_padding <- max(
+    as.integer(padding),
+    as.integer(round(max(subject_width, subject_height) * CROP_PADDING_RATIO))
+  )
 
-  list(
-    x_min = max(min(keep_x) - padding, 1L),
-    x_max = min(max(keep_x) + padding, width),
-    y_min = max(min(keep_y) - padding, 1L),
-    y_max = min(max(keep_y) + padding, height)
+  expand_bbox_to_aspect(
+    bbox = list(
+      x_min = max(min(keep_x) - effective_padding, 1L),
+      x_max = min(max(keep_x) + effective_padding, width),
+      y_min = max(min(keep_y) - effective_padding, 1L),
+      y_max = min(max(keep_y) + effective_padding, height)
+    ),
+    canvas_width = width,
+    canvas_height = height,
+    target_aspect = target_aspect
   )
 }
 
@@ -185,24 +382,46 @@ crop_to_bbox <- function(image, bbox) {
 }
 
 make_average_face_transparent <- function(input_path) {
-  image <- magick::image_read(input_path)
-  image <- magick::image_orient(image)
-  image <- magick::image_convert(image, colorspace = "sRGB")
-  source_info <- magick::image_info(image)[1, , drop = FALSE]
+  source_image <- magick::image_read(input_path)
+  source_image <- magick::image_orient(source_image)
+  source_image <- magick::image_convert(source_image, colorspace = "sRGB")
+  source_info <- magick::image_info(source_image)[1, , drop = FALSE]
+
+  working_image <- source_image
+
+  if (BACKGROUND_PREBLUR_SIGMA > 0) {
+    working_image <- magick::image_blur(
+      working_image,
+      radius = 0,
+      sigma = BACKGROUND_PREBLUR_SIGMA
+    )
+  }
 
   for (fill_point in edge_fill_points(source_info$width[[1]], source_info$height[[1]])) {
-    image <- magick::image_fill(
-      image,
+    working_image <- magick::image_fill(
+      working_image,
       color = "none",
       point = fill_point,
       fuzz = BACKGROUND_FUZZ
     )
   }
 
+  alpha_matrix <- build_smoothed_alpha_matrix(
+    working_image,
+    alpha_threshold = ALPHA_THRESHOLD
+  )
+
+  if (is.null(alpha_matrix)) {
+    image <- magick::image_background(source_image, color = "white", flatten = TRUE)
+  } else {
+    image <- rgba_image_from_source_and_alpha(source_image, alpha_matrix)
+  }
+
   bbox <- alpha_bbox(
-    image = image,
+    alpha_matrix = if (is.null(alpha_matrix)) alpha_matrix_from_image(image) else alpha_matrix,
     alpha_threshold = ALPHA_THRESHOLD,
-    padding = CROP_PADDING
+    padding = CROP_PADDING,
+    target_aspect = as.numeric(source_info$height[[1]]) / as.numeric(source_info$width[[1]])
   )
 
   if (!is.null(bbox)) {

@@ -21,7 +21,8 @@ REQUIRED_PACKAGES <- c(
   "stringr",
   "purrr",
   "tibble",
-  "jsonlite"
+  "jsonlite",
+  "magick"
 )
 
 CANDIDATES_CSV <- file.path("output", "candidatos.csv")
@@ -30,13 +31,16 @@ WORK_CSV <- file.path("output", "experiencia_laboral.csv")
 IMAGE_ROOT <- file.path("output", "images")
 QC_MANIFEST_CSV <- file.path("output", "average_faces", "manifests", "image_manifest.csv")
 
-EXPORT_ROOT <- file.path("output", "album_export")
-EXPORT_IMAGE_ROOT <- file.path(EXPORT_ROOT, "images", "candidates")
-EXPORT_MANIFEST_ROOT <- file.path(EXPORT_ROOT, "manifests")
-EXPORT_JSON_PATH <- file.path(EXPORT_ROOT, "candidates.json")
-EXPORT_MANIFEST_PATH <- file.path(EXPORT_MANIFEST_ROOT, "export_manifest.csv")
-PARTY_MANIFEST_PATH <- file.path(EXPORT_MANIFEST_ROOT, "party_manifest.csv")
-IMPORT_GUIDE_PATH <- file.path(EXPORT_ROOT, "import_guide.md")
+EXPORT_ROOT_JPG <- file.path("output", "album_export")
+EXPORT_ROOT_WEBP <- file.path("output", "album_export_webp")
+
+WEBP_QUALITY <- suppressWarnings(
+  as.integer(Sys.getenv("JNE_EXPORT_WEBP_QUALITY", unset = "90"))
+)
+
+if (length(WEBP_QUALITY) == 0L || is.na(WEBP_QUALITY) || WEBP_QUALITY < 1L || WEBP_QUALITY > 100L) {
+  WEBP_QUALITY <- 90L
+}
 
 QC_EXPORT_COLUMNS <- c(
   "processing_status",
@@ -227,21 +231,39 @@ first_non_missing_chr <- function(x) {
   x[[1]]
 }
 
-rebuild_export_dirs <- function() {
-  export_root_norm <- normalize_export_path(EXPORT_ROOT)
+build_bundle_paths <- function(export_root) {
+  export_manifest_root <- file.path(export_root, "manifests")
+
+  list(
+    export_root = export_root,
+    export_image_root = file.path(export_root, "images", "candidates"),
+    export_manifest_root = export_manifest_root,
+    export_json_path = file.path(export_root, "candidates.json"),
+    export_manifest_path = file.path(export_manifest_root, "export_manifest.csv"),
+    party_manifest_path = file.path(export_manifest_root, "party_manifest.csv"),
+    import_guide_path = file.path(export_root, "import_guide.md")
+  )
+}
+
+rebuild_export_dirs <- function(export_root) {
+  export_root_norm <- normalize_export_path(export_root)
 
   # Guard against accidental deletes outside the expected export folder before
   # rebuilding the handoff bundle from scratch.
-  if (!grepl("/output/album_export$", export_root_norm)) {
+  if (!grepl("/output/album_export(?:_webp)?$", export_root_norm)) {
     abort_export(paste("Refusing to rebuild unexpected export directory:", export_root_norm))
   }
 
-  if (dir.exists(EXPORT_ROOT)) {
-    unlink(EXPORT_ROOT, recursive = TRUE, force = TRUE)
+  if (dir.exists(export_root)) {
+    unlink(export_root, recursive = TRUE, force = TRUE)
   }
 
-  dir.create(EXPORT_IMAGE_ROOT, recursive = TRUE, showWarnings = FALSE)
-  dir.create(EXPORT_MANIFEST_ROOT, recursive = TRUE, showWarnings = FALSE)
+  bundle_paths <- build_bundle_paths(export_root)
+
+  dir.create(bundle_paths$export_image_root, recursive = TRUE, showWarnings = FALSE)
+  dir.create(bundle_paths$export_manifest_root, recursive = TRUE, showWarnings = FALSE)
+
+  invisible(bundle_paths)
 }
 
 build_portrait_lookup <- function(image_root) {
@@ -279,6 +301,69 @@ build_portrait_lookup <- function(image_root) {
   }
 
   lookup
+}
+
+inspect_source_portrait <- function(path) {
+  path <- normalize_export_path(path)
+
+  if (!file.exists(path)) {
+    return(list(valid = FALSE, reason = "missing_file", detail = NA_character_))
+  }
+
+  file_info <- suppressWarnings(file.info(path))
+  file_size <- as.numeric(file_info$size[[1]])
+
+  if (is.na(file_size) || file_size <= 0) {
+    return(list(valid = FALSE, reason = "empty_file", detail = NA_character_))
+  }
+
+  tryCatch({
+    suppressWarnings(magick::image_read(path))
+    list(valid = TRUE, reason = NA_character_, detail = NA_character_)
+  }, error = function(e) {
+    list(
+      valid = FALSE,
+      reason = "unreadable_image",
+      detail = trimws(gsub("[\r\n]+", " ", conditionMessage(e)))
+    )
+  })
+}
+
+validate_export_portraits <- function(export_df, max_examples = 5L) {
+  portrait_checks <- purrr::map(export_df$source_image_abs_path, inspect_source_portrait)
+  invalid_flags <- purrr::map_lgl(portrait_checks, function(x) !isTRUE(x$valid))
+
+  if (!any(invalid_flags)) {
+    return(invisible(TRUE))
+  }
+
+  invalid_checks <- portrait_checks[invalid_flags]
+  invalid_df <- export_df[invalid_flags, , drop = FALSE] %>%
+    dplyr::mutate(
+      validation_reason = purrr::map_chr(invalid_checks, function(x) value_or_na(x$reason)),
+      validation_detail = purrr::map_chr(invalid_checks, function(x) value_or_na(x$detail)),
+      source_image_path = portable_rel_path("output", "images", .data$source_image_relative_path)
+    )
+
+  invalid_preview <- invalid_df %>%
+    dplyr::slice_head(n = max_examples) %>%
+    dplyr::transmute(
+      preview = ifelse(
+        is.na(.data$validation_detail),
+        paste0(.data$source_image_path, " [", .data$validation_reason, "]"),
+        paste0(.data$source_image_path, " [", .data$validation_reason, ": ", .data$validation_detail, "]")
+      )
+    ) %>%
+    dplyr::pull(.data$preview)
+
+  abort_export(
+    paste(
+      paste0("Invalid portrait source files were found under output/images (", nrow(invalid_df), ")."),
+      paste0("Examples: ", paste(invalid_preview, collapse = " | ")),
+      "Repair or redownload the broken portraits, then rerun script 5.",
+      sep = " "
+    )
+  )
 }
 
 build_qc_lookup <- function(path) {
@@ -326,21 +411,50 @@ build_qc_lookup <- function(path) {
   list(data = qc_lookup, available = TRUE)
 }
 
-copy_export_portraits <- function(export_df) {
+write_export_asset <- function(source_path, dest_path, asset_format = "jpg", quality = NA_integer_) {
+  dir.create(dirname(dest_path), recursive = TRUE, showWarnings = FALSE)
+
+  if (identical(asset_format, "jpg")) {
+    success <- file.copy(source_path, dest_path, overwrite = TRUE, copy.mode = TRUE)
+    return(isTRUE(success) && file.exists(dest_path))
+  }
+
+  if (identical(asset_format, "webp")) {
+    success <- tryCatch({
+      image <- magick::image_read(source_path)
+      magick::image_write(
+        image,
+        path = dest_path,
+        format = "webp",
+        quality = quality
+      )
+      file.exists(dest_path)
+    }, error = function(e) FALSE)
+
+    return(isTRUE(success))
+  }
+
+  abort_export(paste("Unsupported export asset format:", asset_format))
+}
+
+copy_export_portraits <- function(export_df, export_root, asset_format = "jpg", quality = NA_integer_) {
   copied <- 0L
 
   # Copy portraits into a flat, deterministic export layout so downstream tools
   # do not need to know the original district/party folder structure.
   for (row_idx in seq_len(nrow(export_df))) {
     source_path <- export_df$source_image_abs_path[[row_idx]]
-    dest_path <- file.path(EXPORT_ROOT, export_df$stickerImage[[row_idx]])
+    dest_path <- file.path(export_root, export_df$stickerImage[[row_idx]])
 
-    dir.create(dirname(dest_path), recursive = TRUE, showWarnings = FALSE)
-
-    success <- file.copy(source_path, dest_path, overwrite = TRUE, copy.mode = TRUE)
+    success <- write_export_asset(
+      source_path = source_path,
+      dest_path = dest_path,
+      asset_format = asset_format,
+      quality = quality
+    )
 
     if (!isTRUE(success) || !file.exists(dest_path)) {
-      abort_export(paste("Failed to copy portrait asset:", source_path))
+      abort_export(paste("Failed to write portrait asset:", source_path))
     }
 
     copied <- copied + 1L
@@ -355,8 +469,11 @@ build_import_guide <- function(
   image_count,
   qc_available,
   qc_matched_count,
+  bundle_root,
+  asset_extension,
   candidate_only_note = TRUE
 ) {
+  bundle_root <- gsub("\\\\", "/", bundle_root)
   qc_status_line <- if (isTRUE(qc_available)) {
     paste0(
       "- QC merge: `output/average_faces/manifests/image_manifest.csv` was found and matched `",
@@ -379,8 +496,8 @@ build_import_guide <- function(
     "## Snapshot",
     paste0("- Candidates exported: `", export_count, "`"),
     paste0("- Parties represented: `", party_count, "`"),
-    paste0("- Portrait assets copied: `", image_count, "`"),
-    "- Bundle root: `output/album_export/`",
+    paste0("- Portrait assets written: `", image_count, "`"),
+    paste0("- Bundle root: `", bundle_root, "/`"),
     "",
     "## Files",
     "- `candidates.json`: album-ready sticker dataset using the `_examples/candidates.json` contract.",
@@ -396,7 +513,11 @@ build_import_guide <- function(
     "- `sentenciado`: `TRUE` if the candidate appears in `output/relacion_sentencias.csv`, otherwise `FALSE`.",
     "- `trabaja`: `TRUE` if the candidate appears in `output/experiencia_laboral.csv`, otherwise `FALSE`.",
     "- `ingresos`: integer soles parsed from `ingresos_total_ingresos`; blank in the manifest and `null` in JSON when missing.",
-    "- `stickerImage` and `portraitImage`: both point to the same copied JPG for fastest owner integration.",
+    paste0(
+      "- `stickerImage` and `portraitImage`: both point to the same exported `",
+      asset_extension,
+      "` portrait asset."
+    ),
     "",
     "## Notes",
     qc_status_line,
@@ -404,6 +525,190 @@ build_import_guide <- function(
     "- Portrait inclusion is driven by the local `output/images/` tree, not `ruta_imagen`, because some candidate rows do not persist that field.",
     "- Sort order is deterministic: region, then party, then candidate name, then source ID.",
     sep = "\n"
+  )
+}
+
+webp_write_supported <- function() {
+  temp_path <- tempfile(fileext = ".webp")
+  on.exit(unlink(temp_path, force = TRUE), add = TRUE)
+
+  tryCatch({
+    magick::image_write(
+      magick::image_blank(width = 2, height = 2, color = "white"),
+      path = temp_path,
+      format = "webp",
+      quality = WEBP_QUALITY
+    )
+    file.exists(temp_path)
+  }, error = function(e) FALSE)
+}
+
+write_export_bundle <- function(
+  export_df,
+  qc_lookup,
+  export_root,
+  asset_extension = ".jpg",
+  asset_format = "jpg",
+  asset_quality = NA_integer_,
+  bundle_label = "JPG"
+) {
+  bundle_paths <- rebuild_export_dirs(export_root)
+
+  bundle_df <- export_df %>%
+    dplyr::mutate(
+      stickerImage = portable_rel_path("images", "candidates", paste0(.data$export_id, asset_extension)),
+      portraitImage = .data$stickerImage
+    )
+
+  image_count <- copy_export_portraits(
+    bundle_df,
+    export_root = export_root,
+    asset_format = asset_format,
+    quality = asset_quality
+  )
+
+  json_df <- bundle_df %>%
+    dplyr::transmute(
+      id = .data$export_id,
+      type = .data$type,
+      name = .data$name,
+      party = .data$party,
+      region = .data$region,
+      bioShort = .data$bioShort,
+      stickerImage = .data$stickerImage,
+      portraitImage = .data$portraitImage,
+      sentenciado = .data$sentenciado,
+      ingresos = .data$ingresos,
+      trabaja = .data$trabaja
+    )
+
+  json_rows <- purrr::pmap(
+    json_df,
+    function(id, type, name, party, region, bioShort, stickerImage, portraitImage, sentenciado, ingresos, trabaja) {
+      list(
+        id = id,
+        type = type,
+        name = name,
+        party = party,
+        region = region,
+        bioShort = bioShort,
+        stickerImage = stickerImage,
+        portraitImage = portraitImage,
+        sentenciado = sentenciado,
+        ingresos = ingresos,
+        trabaja = trabaja
+      )
+    }
+  )
+
+  jsonlite::write_json(
+    json_rows,
+    path = bundle_paths$export_json_path,
+    pretty = TRUE,
+    auto_unbox = TRUE,
+    na = "null",
+    null = "null"
+  )
+
+  export_manifest <- bundle_df %>%
+    dplyr::transmute(
+      sort_order = .data$sort_order,
+      id = .data$export_id,
+      source_id_candidato = .data$id_candidato,
+      source_partido_id = .data$partido_id,
+      type = .data$type,
+      name = .data$name,
+      party = .data$party,
+      region = .data$region,
+      bioShort = .data$bioShort,
+      stickerImage = .data$stickerImage,
+      portraitImage = .data$portraitImage,
+      sentenciado = bool_to_upper_vec(.data$sentenciado),
+      ingresos = ifelse(is.na(.data$ingresos), NA_character_, as.character(.data$ingresos)),
+      trabaja = bool_to_upper_vec(.data$trabaja),
+      source_url_hoja_vida = .data$url_hoja_vida,
+      source_url_imagen = .data$url_imagen,
+      source_image_path = portable_rel_path("output", "images", .data$source_image_relative_path),
+      source_raw_income_text = .data$ingresos_total_ingresos,
+      source_cargo_postula_raw = .data$cargo_postula,
+      source_region_raw = .data$distrito_electoral,
+      source_party_raw = .data$partido_politico,
+      source_nombre_raw = .data$nombre,
+      qc_processing_status = .data$qc_processing_status,
+      qc_skip_reason = .data$qc_skip_reason,
+      qc_alignment_mode = .data$qc_alignment_mode,
+      qc_face_count = .data$qc_face_count,
+      qc_multi_face_flag = .data$qc_multi_face_flag,
+      qc_blur_pct = .data$qc_blur_pct,
+      qc_face_size_pct = .data$qc_face_size_pct,
+      qc_center_offset_pct = .data$qc_center_offset_pct,
+      qc_contrast_pct = .data$qc_contrast_pct,
+      qc_exposure_score = .data$qc_exposure_score,
+      qc_quality_score = .data$qc_quality_score,
+      qc_quality_band = .data$qc_quality_band,
+      qc_quality_exclusion_reason = .data$qc_quality_exclusion_reason,
+      qc_eligible_filtered = .data$qc_eligible_filtered,
+      qc_eligible_all = .data$qc_eligible_all
+    )
+
+  write_csv_chr(export_manifest, bundle_paths$export_manifest_path)
+
+  party_manifest <- bundle_df %>%
+    dplyr::transmute(
+      partido_id = .data$partido_id,
+      party = .data$party,
+      party_slug = purrr::map_chr(.data$party, slugify_path),
+      url_logo_partido = .data$url_logo_partido
+    ) %>%
+    dplyr::group_by(.data$partido_id, .data$party, .data$party_slug) %>%
+    dplyr::summarise(
+      candidate_count = dplyr::n(),
+      url_logo_partido = first_non_missing_chr(.data$url_logo_partido),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(.data$party, .data$partido_id)
+
+  write_csv_chr(party_manifest, bundle_paths$party_manifest_path)
+
+  qc_matched_count <- export_manifest %>%
+    dplyr::filter(!is.na(.data$qc_processing_status) | !is.na(.data$qc_quality_score) | !is.na(.data$qc_eligible_all)) %>%
+    nrow()
+
+  writeLines(
+    build_import_guide(
+      export_count = nrow(bundle_df),
+      party_count = nrow(party_manifest),
+      image_count = image_count,
+      qc_available = qc_lookup$available,
+      qc_matched_count = qc_matched_count,
+      bundle_root = export_root,
+      asset_extension = sub("^\\.", "", asset_extension)
+    ),
+    bundle_paths$import_guide_path,
+    useBytes = TRUE
+  )
+
+  if (image_count != nrow(bundle_df)) {
+    abort_export("The number of written portrait assets does not match the export row count.")
+  }
+
+  export_asset_exists <- file.exists(file.path(export_root, bundle_df$stickerImage))
+  if (!all(export_asset_exists)) {
+    abort_export("At least one exported portrait asset is missing after write.")
+  }
+
+  json_ids_unique <- length(unique(json_df$id)) == nrow(json_df)
+  if (!isTRUE(json_ids_unique)) {
+    abort_export("JSON IDs are not unique.")
+  }
+
+  log_message(paste(bundle_label, "bundle written to:", normalize_export_path(export_root)))
+
+  list(
+    bundle_label = bundle_label,
+    export_root = export_root,
+    image_count = image_count,
+    party_count = nrow(party_manifest)
   )
 }
 
@@ -556,9 +861,7 @@ export_df <- candidate_df %>%
     ),
     sentenciado = dplyr::coalesce(.data$has_sentence, FALSE),
     trabaja = dplyr::coalesce(.data$has_work, FALSE),
-    ingresos = purrr::map_int(.data$ingresos_total_ingresos, parse_income_integer),
-    stickerImage = portable_rel_path("images", "candidates", paste0(.data$export_id, ".jpg")),
-    portraitImage = .data$stickerImage
+    ingresos = purrr::map_int(.data$ingresos_total_ingresos, parse_income_integer)
   ) %>%
   dplyr::arrange(.data$region, .data$party, .data$type, .data$name, .data$id_candidato) %>%
   dplyr::mutate(sort_order = dplyr::row_number())
@@ -583,158 +886,53 @@ if (any(is.na(export_df$type) | !nzchar(export_df$type))) {
   abort_export("At least one candidate is missing type after normalization.")
 }
 
+log_message("Validating portrait source files.")
+validate_export_portraits(export_df)
+
 
 # ======================================
 # ==========  WRITE BUNDLE =============
 # ======================================
 
-log_message("Rebuilding output/album_export.")
-rebuild_export_dirs()
+if (!webp_write_supported()) {
+  abort_export("WebP export is not supported by the current magick/ImageMagick build.")
+}
 
-copied_images <- copy_export_portraits(export_df)
-
-json_df <- export_df %>%
-  dplyr::transmute(
-    id = .data$export_id,
-    type = .data$type,
-    name = .data$name,
-    party = .data$party,
-    region = .data$region,
-    bioShort = .data$bioShort,
-    stickerImage = .data$stickerImage,
-    portraitImage = .data$portraitImage,
-    sentenciado = .data$sentenciado,
-    ingresos = .data$ingresos,
-    trabaja = .data$trabaja
-  )
-
-json_rows <- purrr::pmap(
-  json_df,
-  function(id, type, name, party, region, bioShort, stickerImage, portraitImage, sentenciado, ingresos, trabaja) {
-    list(
-      id = id,
-      type = type,
-      name = name,
-      party = party,
-      region = region,
-      bioShort = bioShort,
-      stickerImage = stickerImage,
-      portraitImage = portraitImage,
-      sentenciado = sentenciado,
-      ingresos = ingresos,
-      trabaja = trabaja
-    )
-  }
-)
-
-jsonlite::write_json(
-  json_rows,
-  path = EXPORT_JSON_PATH,
-  pretty = TRUE,
-  auto_unbox = TRUE,
-  na = "null",
-  null = "null"
-)
-
-export_manifest <- export_df %>%
-  dplyr::transmute(
-    sort_order = .data$sort_order,
-    id = .data$export_id,
-    source_id_candidato = .data$id_candidato,
-    source_partido_id = .data$partido_id,
-    type = .data$type,
-    name = .data$name,
-    party = .data$party,
-    region = .data$region,
-    bioShort = .data$bioShort,
-    stickerImage = .data$stickerImage,
-    portraitImage = .data$portraitImage,
-    sentenciado = bool_to_upper_vec(.data$sentenciado),
-    ingresos = ifelse(is.na(.data$ingresos), NA_character_, as.character(.data$ingresos)),
-    trabaja = bool_to_upper_vec(.data$trabaja),
-    source_url_hoja_vida = .data$url_hoja_vida,
-    source_url_imagen = .data$url_imagen,
-    source_image_path = portable_rel_path("output", "images", .data$source_image_relative_path),
-    source_raw_income_text = .data$ingresos_total_ingresos,
-    source_cargo_postula_raw = .data$cargo_postula,
-    source_region_raw = .data$distrito_electoral,
-    source_party_raw = .data$partido_politico,
-    source_nombre_raw = .data$nombre,
-    qc_processing_status = .data$qc_processing_status,
-    qc_skip_reason = .data$qc_skip_reason,
-    qc_alignment_mode = .data$qc_alignment_mode,
-    qc_face_count = .data$qc_face_count,
-    qc_multi_face_flag = .data$qc_multi_face_flag,
-    qc_blur_pct = .data$qc_blur_pct,
-    qc_face_size_pct = .data$qc_face_size_pct,
-    qc_center_offset_pct = .data$qc_center_offset_pct,
-    qc_contrast_pct = .data$qc_contrast_pct,
-    qc_exposure_score = .data$qc_exposure_score,
-    qc_quality_score = .data$qc_quality_score,
-    qc_quality_band = .data$qc_quality_band,
-    qc_quality_exclusion_reason = .data$qc_quality_exclusion_reason,
-    qc_eligible_filtered = .data$qc_eligible_filtered,
-    qc_eligible_all = .data$qc_eligible_all
-  )
-
-write_csv_chr(export_manifest, EXPORT_MANIFEST_PATH)
-
-party_manifest <- export_df %>%
-  dplyr::transmute(
-    partido_id = .data$partido_id,
-    party = .data$party,
-    party_slug = purrr::map_chr(.data$party, slugify_path),
-    url_logo_partido = .data$url_logo_partido
-  ) %>%
-  dplyr::group_by(.data$partido_id, .data$party, .data$party_slug) %>%
-  dplyr::summarise(
-    candidate_count = dplyr::n(),
-    url_logo_partido = first_non_missing_chr(.data$url_logo_partido),
-    .groups = "drop"
-  ) %>%
-  dplyr::arrange(.data$party, .data$partido_id)
-
-write_csv_chr(party_manifest, PARTY_MANIFEST_PATH)
-
-qc_matched_count <- export_manifest %>%
-  dplyr::filter(!is.na(.data$qc_processing_status) | !is.na(.data$qc_quality_score) | !is.na(.data$qc_eligible_all)) %>%
-  nrow()
-
-writeLines(
-  build_import_guide(
-    export_count = nrow(export_df),
-    party_count = nrow(party_manifest),
-    image_count = copied_images,
-    qc_available = qc_lookup$available,
-    qc_matched_count = qc_matched_count
+bundle_specs <- list(
+  list(
+    export_root = EXPORT_ROOT_JPG,
+    asset_extension = ".jpg",
+    asset_format = "jpg",
+    asset_quality = NA_integer_,
+    bundle_label = "JPG"
   ),
-  IMPORT_GUIDE_PATH,
-  useBytes = TRUE
+  list(
+    export_root = EXPORT_ROOT_WEBP,
+    asset_extension = ".webp",
+    asset_format = "webp",
+    asset_quality = WEBP_QUALITY,
+    bundle_label = "WebP"
+  )
 )
 
+bundle_results <- purrr::map(bundle_specs, function(bundle_spec) {
+  log_message(paste("Rebuilding", gsub("\\\\", "/", bundle_spec$export_root)))
 
-# ======================================
-# ==========  VALIDATION ===============
-# ======================================
+  write_export_bundle(
+    export_df = export_df,
+    qc_lookup = qc_lookup,
+    export_root = bundle_spec$export_root,
+    asset_extension = bundle_spec$asset_extension,
+    asset_format = bundle_spec$asset_format,
+    asset_quality = bundle_spec$asset_quality,
+    bundle_label = bundle_spec$bundle_label
+  )
+})
 
-log_message("Running export validations.")
-
-if (copied_images != nrow(export_df)) {
-  abort_export("The number of copied images does not match the export row count.")
-}
-
-export_asset_exists <- file.exists(file.path(EXPORT_ROOT, export_df$stickerImage))
-if (!all(export_asset_exists)) {
-  abort_export("At least one exported portrait asset is missing after copy.")
-}
-
-json_ids_unique <- length(unique(json_df$id)) == nrow(json_df)
-if (!isTRUE(json_ids_unique)) {
-  abort_export("JSON IDs are not unique.")
-}
 
 log_message(paste("Candidates exported:", nrow(export_df)))
-log_message(paste("Party manifest rows:", nrow(party_manifest)))
-log_message(paste("Portrait assets copied:", copied_images))
+for (bundle_result in bundle_results) {
+  log_message(paste(bundle_result$bundle_label, "party manifest rows:", bundle_result$party_count))
+  log_message(paste(bundle_result$bundle_label, "portrait assets written:", bundle_result$image_count))
+}
 log_message(paste("QC manifest detected:", if (isTRUE(qc_lookup$available)) "yes" else "no"))
-log_message(paste("Album export written to:", normalize_export_path(EXPORT_ROOT)))

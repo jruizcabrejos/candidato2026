@@ -331,6 +331,13 @@ normalize_existing_path <- function(path) {
     return(NA_character_)
   }
 
+  file_info <- suppressWarnings(file.info(path))
+  file_size <- as.numeric(file_info$size[[1]])
+
+  if (is.na(file_size) || file_size <= 0) {
+    return(NA_character_)
+  }
+
   normalizePath(path, winslash = "/", mustWork = FALSE)
 }
 
@@ -2796,16 +2803,30 @@ download_candidate_image <- function(url_imagen, dest_path, overwrite = FALSE) {
 
   dir.create(dirname(dest_path), recursive = TRUE, showWarnings = FALSE)
 
-  if (file.exists(dest_path) && !isTRUE(overwrite)) {
+  existing_info <- suppressWarnings(file.info(dest_path))
+  existing_size <- as.numeric(existing_info$size[[1]])
+  existing_valid <- isTRUE(file.exists(dest_path)) && !is.na(existing_size) && existing_size > 0
+
+  if (existing_valid && !isTRUE(overwrite)) {
     return(normalizePath(dest_path, winslash = "/", mustWork = FALSE))
+  }
+
+  if (file.exists(dest_path)) {
+    unlink(dest_path, force = TRUE)
   }
 
   success <- tryCatch({
     utils::download.file(url_imagen, destfile = dest_path, mode = "wb", quiet = TRUE)
-    file.exists(dest_path)
+    downloaded_info <- suppressWarnings(file.info(dest_path))
+    downloaded_size <- as.numeric(downloaded_info$size[[1]])
+    isTRUE(file.exists(dest_path)) && !is.na(downloaded_size) && downloaded_size > 0
   }, error = function(e) FALSE, warning = function(w) FALSE)
 
   if (!isTRUE(success)) {
+    if (file.exists(dest_path)) {
+      unlink(dest_path, force = TRUE)
+    }
+
     return(NA_character_)
   }
 

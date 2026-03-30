@@ -25,6 +25,7 @@ SEX_OVERRIDE_CSV <- file.path("data", "manual", "sex_overrides.csv")
 
 BLEND_MODES <- c("filtered", "all_faces")
 GROUP_MODES <- c("all", "sex", "region", "region_sex", "affiliation", "affiliation_sex", "region_affiliation")
+TARGET_CANDIDATE_TYPE <- "Diputado"
 
 MIN_VALID_IMAGES <- 3L
 TARGET_WIDTH <- 427L
@@ -99,6 +100,15 @@ log_message <- function(text) {
 
 normalize_fs_path <- function(path) {
   normalizePath(path, winslash = "/", mustWork = FALSE)
+}
+
+normalize_candidate_office <- function(type_value, cargo_value = NA_character_) {
+  coalesce_chr(
+    derive_candidate_type(type_value),
+    derive_candidate_type(cargo_value),
+    value_or_na(type_value),
+    value_or_na(cargo_value)
+  )
 }
 
 trim_na_chr <- function(x) {
@@ -212,6 +222,7 @@ derive_candidate_name_from_file <- function(file_name) {
 empty_candidate_metadata <- function() {
   tibble::tibble(
     id_candidato = character(),
+    office_type = character(),
     nombre = character(),
     sexo_raw = character(),
     distrito_electoral = character(),
@@ -230,9 +241,13 @@ load_candidate_metadata <- function(path) {
 
   # Normalize the metadata early so later QC and grouping steps can trust the
   # same region, party, and candidate-id fields everywhere.
-  candidate_df %>%
+  candidate_df <- candidate_df %>%
     dplyr::transmute(
       id_candidato = trim_na_chr(.data$id_candidato),
+      office_type = purrr::pmap_chr(
+        list(.data$type, .data$cargo_postula),
+        normalize_candidate_office
+      ),
       nombre = trim_na_chr(.data$nombre),
       sexo_raw = trim_na_chr(.data$sexo),
       distrito_electoral = trim_na_chr(.data$distrito_electoral),
@@ -242,6 +257,18 @@ load_candidate_metadata <- function(path) {
     ) %>%
     dplyr::filter(!is.na(.data$id_candidato)) %>%
     dplyr::distinct(.data$id_candidato, .keep_all = TRUE)
+
+  candidate_df <- candidate_df %>%
+    dplyr::filter(clean_name_es(.data$office_type) == clean_name_es(TARGET_CANDIDATE_TYPE))
+
+  if (nrow(candidate_df) == 0) {
+    stop(
+      sprintf("No %s candidate rows were found in output/candidatos.csv.", TARGET_CANDIDATE_TYPE),
+      call. = FALSE
+    )
+  }
+
+  candidate_df
 }
 
 empty_lookup_tibble <- function() {
@@ -551,6 +578,16 @@ assign_candidate_sex <- function(candidate_metadata, first_name_lookup, sex_over
 }
 
 discover_portrait_manifest <- function(image_root, candidate_metadata) {
+  candidate_ids <- unique(candidate_metadata$id_candidato)
+  candidate_ids <- candidate_ids[!is.na(candidate_ids) & nzchar(candidate_ids)]
+
+  if (length(candidate_ids) == 0L) {
+    stop(
+      sprintf("No %s candidate ids were available for portrait discovery.", TARGET_CANDIDATE_TYPE),
+      call. = FALSE
+    )
+  }
+
   files <- list.files(
     image_root,
     pattern = "\\.jpg$",
@@ -565,7 +602,7 @@ discover_portrait_manifest <- function(image_root, candidate_metadata) {
 
   root_norm <- normalize_fs_path(image_root)
 
-  tibble::tibble(
+  portrait_manifest <- tibble::tibble(
     image_path = sort(normalize_fs_path(files))
   ) %>%
     dplyr::mutate(
@@ -577,6 +614,24 @@ discover_portrait_manifest <- function(image_root, candidate_metadata) {
       id_candidato = purrr::map_chr(.data$file_name, derive_candidate_id_from_file)
     ) %>%
     dplyr::select(-"path_parts") %>%
+    dplyr::filter(!is.na(.data$id_candidato)) %>%
+    dplyr::semi_join(
+      tibble::tibble(id_candidato = candidate_ids),
+      by = "id_candidato"
+    )
+
+  if (nrow(portrait_manifest) == 0L) {
+    stop(
+      sprintf(
+        "No portrait JPG files matched %s candidate ids under %s.",
+        TARGET_CANDIDATE_TYPE,
+        image_root
+      ),
+      call. = FALSE
+    )
+  }
+
+  portrait_manifest %>%
     dplyr::left_join(candidate_metadata, by = "id_candidato") %>%
     dplyr::mutate(
       nombre = purrr::pmap_chr(
@@ -1638,6 +1693,7 @@ image_manifest <- discover_portrait_manifest(INPUT_IMAGE_ROOT, candidate_assignm
 
 # First evaluate portraits one by one, then build composite outputs from the
 # cleaned manifest instead of mixing validation and rendering together.
+log_message(paste("Target office type:", TARGET_CANDIDATE_TYPE))
 log_message(paste("Portrait files discovered:", nrow(image_manifest)))
 log_message(paste("Candidate metadata rows loaded:", nrow(candidate_metadata)))
 log_message(paste("First-name lookup rows loaded:", nrow(first_name_lookup)))
