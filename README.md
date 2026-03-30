@@ -1,15 +1,18 @@
-# 🗳️ Recopilación y Procesamiento de Datos: Elecciones Perú 2026
+# 🗳️ Recopilación y Procesamiento de Datos: Elecciones Generales Perú 2026
 
-Este repositorio contiene un flujo local para recopilar, reconstruir, procesar y exportar datos publicos de candidaturas para las elecciones de Peru 2026.
+Este repositorio contiene un flujo en R que utiliza R Selenium para recopilar, reconstruir, procesar y exportar datos publicos de todas las candidaturas en las elecciones generales de Peru 2026.
 
-## 📊 Estado Actual (al 26 de marzo de 2026)
+Hecho con la gente del colectivo IncaSlop: https://incaslop.online/
+
+## 📊 Estado Actual (al 30 de marzo de 2026)
 
 *   **27** listados de distritos recopilados.
-*   **4,356** perfiles individuales de candidatos guardados.
-*   **4,356** fotografías de postulantes descargadas.
+*   **5,536** perfiles individuales de candidatos guardados.
+    *    **4,456** perfiles de candidatos a diputado/a.   
+*   **5,536** fotografías de postulantes descargadas.
 *   Datos de candidatos pertenecientes a **37** partidos políticos.
 
-## ⚙️ Cómo Funciona el Proceso
+## ⚙️ Cómo Funciona
 
 *   **Paso 1: Recopilación (`scripts/1_scrapper.R`)**
     Navega el sitio público web, guarda la información cruda (HTML), descarga las fotografías y actualiza los archivos de datos (CSV).
