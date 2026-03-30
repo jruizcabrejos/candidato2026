@@ -71,6 +71,7 @@ candidate_output_columns <- c(
   "codigo_distrito_electoral",
   "distrito_electoral",
   "cargo_postula",
+  "type",
   "dni",
   "nombre",
   "partido_politico",
@@ -90,6 +91,23 @@ candidate_output_columns <- c(
   "ingresos_remuneracion_bruta_privado",
   "ingresos_total_ingresos",
   "fecha_captura"
+)
+
+listing_output_columns <- c(
+  "card_index",
+  "codigo_distrito_electoral",
+  "distrito_electoral",
+  "numero_postulacion",
+  "nombre",
+  "dni_listado",
+  "partido_politico",
+  "cargo_postula",
+  "type",
+  "estado_inadmisible",
+  "url_imagen",
+  "url_logo_partido",
+  "url_hoja_vida",
+  "card_html"
 )
 
 section_file_map <- c(
@@ -135,6 +153,7 @@ candidate_status_path <- file.path("output", "candidatos_estado.csv")
 candidate_status_columns <- c(
   "id_candidato",
   "estado",
+  "type",
   "distrito_electoral",
   "codigo_distrito_electoral",
   "url_hoja_vida",
@@ -157,41 +176,39 @@ empty_chr_tibble <- function(columns) {
   )
 }
 
+ensure_table_columns <- function(path, required_cols) {
+  existing <- read_csv_chr(path)
+
+  if (is.null(existing)) {
+    readr::write_csv(empty_chr_tibble(required_cols), path, na = "")
+    return(invisible(empty_chr_tibble(required_cols)))
+  }
+
+  missing_cols <- setdiff(required_cols, names(existing))
+
+  for (col_name in missing_cols) {
+    existing[[col_name]] <- NA_character_
+  }
+
+  ordered_cols <- c(required_cols, setdiff(names(existing), required_cols))
+  existing <- existing[, ordered_cols, drop = FALSE]
+  write_csv_chr(existing, path)
+
+  invisible(existing)
+}
+
 ensure_output_files <- function() {
   candidatos_path <- file.path(".", "output", "candidatos.csv")
   errores_path <- file.path(".", "output", "errores_scrape.csv")
 
-  if (!file.exists(candidatos_path)) {
-    readr::write_csv(empty_chr_tibble(candidate_output_columns), candidatos_path)
-  }
-
-  if (!file.exists(errores_path)) {
-    readr::write_csv(empty_chr_tibble(error_output_columns), errores_path)
-  }
-
-  if (!file.exists(candidate_status_path)) {
-    readr::write_csv(empty_chr_tibble(candidate_status_columns), candidate_status_path)
-  }
+  ensure_table_columns(candidatos_path, candidate_output_columns)
+  ensure_table_columns(errores_path, error_output_columns)
+  ensure_table_columns(candidate_status_path, candidate_status_columns)
 
   for (section_name in names(section_file_map)) {
     section_path <- section_file_map[[section_name]]
     default_cols <- section_default_columns[[section_name]]
-
-    existing <- if (file.exists(section_path)) {
-      readr::read_csv(
-        section_path,
-        col_types = readr::cols(.default = readr::col_character()),
-        show_col_types = FALSE
-      )
-    } else {
-      NULL
-    }
-
-    if (is.null(existing) || nrow(existing) == 0) {
-      if (is.null(existing) || !identical(names(existing), default_cols)) {
-        readr::write_csv(empty_chr_tibble(default_cols), section_path, na = "")
-      }
-    }
+    ensure_table_columns(section_path, default_cols)
   }
 
   invisible(candidatos_path)
@@ -541,6 +558,7 @@ mark_candidate_completed <- function(main_row, path = candidate_status_path) {
   status_row <- tibble::tibble(
     id_candidato = coalesce_chr(main_row$id_candidato[[1]]),
     estado = "completed",
+    type = coalesce_chr(main_row$type[[1]]),
     distrito_electoral = coalesce_chr(main_row$distrito_electoral[[1]]),
     codigo_distrito_electoral = coalesce_chr(main_row$codigo_distrito_electoral[[1]]),
     url_hoja_vida = coalesce_chr(main_row$url_hoja_vida[[1]]),
@@ -562,6 +580,7 @@ save_district_checkpoint <- function(district_row, district_idx = NA_integer_, r
   # useful when a long live run is interrupted partway through.
   district_row <- tibble::as_tibble(district_row)
 
+  target_slug <- coalesce_chr(district_row$target_slug[[1]])
   district_code <- coalesce_chr(district_row$codigo_distrito_electoral[[1]])
   district_name <- coalesce_chr(district_row$distrito_electoral[[1]], "sin-distrito")
 
@@ -572,7 +591,16 @@ save_district_checkpoint <- function(district_row, district_idx = NA_integer_, r
 
   checkpoint_dir <- file.path(
     root_dir,
-    paste0(prefix, district_code, "_", slugify_path(district_name))
+    paste0(
+      prefix,
+      paste(
+        {
+          checkpoint_parts <- c(target_slug, district_code, slugify_path(district_name))
+          checkpoint_parts[!is.na(checkpoint_parts) & nzchar(checkpoint_parts)]
+        },
+        collapse = "_"
+      )
+    )
   )
 
   if (!dir.exists(checkpoint_dir)) {
@@ -611,6 +639,7 @@ save_district_checkpoint <- function(district_row, district_idx = NA_integer_, r
   }
 
   checkpoint_info <- tibble::tibble(
+    target_slug = target_slug,
     distrito_electoral = district_name,
     codigo_distrito_electoral = district_code,
     checkpoint_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
@@ -651,7 +680,112 @@ safe_html_attr <- function(node, attr) {
 }
 
 section_title_key <- function(section_title) {
-  clean_name_es(section_title)
+  key <- clean_name_es(section_title)
+
+  if (is.na(key)) {
+    return(NA_character_)
+  }
+
+  if (grepl("^informacion_general$", key)) {
+    return("informacion_general")
+  }
+
+  if (grepl("^formacion_academica$", key)) {
+    return("formacion_academica")
+  }
+
+  if (grepl("^educacion_basica$", key)) {
+    return("educacion_basica")
+  }
+
+  if (grepl("^estudios_tecnicos$", key)) {
+    return("estudios_tecnicos")
+  }
+
+  if (grepl("^estudios_no_universitarios$", key)) {
+    return("estudios_no_universitarios")
+  }
+
+  if (grepl("^estudios_universitarios$", key)) {
+    return("estudios_universitarios")
+  }
+
+  if (grepl("^estudios_de_posgrado$|^estudios_posgrado$", key)) {
+    return("estudios_posgrado")
+  }
+
+  if (grepl("^experiencia_laboral$", key)) {
+    return("experiencia_laboral")
+  }
+
+  if (grepl("^cargos_partidarios_o_de_eleccion_popular$|^trayectoria_politica$", key)) {
+    return("trayectoria_politica")
+  }
+
+  if (grepl("^cargos_partidarios$", key)) {
+    return("cargos_partidarios")
+  }
+
+  if (grepl("^eleccion_popular$|^cargos_de_eleccion_popular$", key)) {
+    return("eleccion_popular")
+  }
+
+  if (grepl("^relacion_de_sentencias$|^declaracion_de_sentencias_firmes$", key)) {
+    return("declaracion_de_sentencias_firmes")
+  }
+
+  if (grepl("^ingresos_de_bienes_y_rentas$|^ingreso_de_bienes_y_rentas$", key)) {
+    return("ingreso_de_bienes_y_rentas")
+  }
+
+  if (grepl("^bienes_muebles_inmuebles$", key)) {
+    return("bienes_muebles_inmuebles")
+  }
+
+  if (grepl("^informacion_adicional$", key)) {
+    return("informacion_adicional")
+  }
+
+  if (grepl("^anotacion_marginal$", key)) {
+    return("anotacion_marginal")
+  }
+
+  key
+}
+
+extract_profile_summary_node <- function(page) {
+  coalesce_chr_node <- function(...) {
+    nodes <- list(...)
+
+    for (node in nodes) {
+      if (length(node) > 0 && !inherits(node, "xml_missing")) {
+        return(node)
+      }
+    }
+
+    xml2::xml_missing()
+  }
+
+  coalesce_chr_node(
+    rvest::html_element(page, "#content-postulacion-comparacion"),
+    rvest::html_element(page, "main #content-postulacion-comparacion"),
+    rvest::html_element(page, "div[id='content-postulacion-comparacion']")
+  )
+}
+
+extract_profile_name <- function(page) {
+  summary_node <- extract_profile_summary_node(page)
+  name_candidates <- compact_lines(c(
+    safe_html_text(rvest::html_element(summary_node, "h2")),
+    safe_html_text(rvest::html_element(page, "main h2[translate='no']")),
+    safe_html_text(rvest::html_element(page, "main h1"))
+  ))
+
+  name_candidates <- name_candidates[
+    !grepl("^candidatos_eg_2026$", clean_name_es(name_candidates))
+  ]
+
+  value_or_na(name_candidates[1])
 }
 
 extract_district_options <- function(page) {
@@ -687,7 +821,7 @@ extract_party_id_from_logo_url <- function(url_logo_partido) {
     return(NA_character_)
   }
 
-  matched <- stringr::str_match(url_logo_partido, "(?:GetSimbolo/|/)([0-9]+)(?:\\?.*)?$")
+  matched <- stringr::str_match(url_logo_partido, "(?:GetSimbolo/|LogoOp/|/)([0-9]+)(?:\\.[A-Za-z0-9]+)?(?:\\?.*)?$")
   value_or_na(matched[, 2])
 }
 
@@ -713,6 +847,144 @@ build_profile_url_from_ids <- function(partido_id, dni, base = "https://votoinfo
 build_profile_url_from_listing <- function(url_logo_partido, dni, base = "https://votoinformadoia.jne.gob.pe") {
   partido_id <- extract_party_id_from_logo_url(url_logo_partido)
   build_profile_url_from_ids(partido_id, dni, base = base)
+}
+
+build_listing_row <- function(card_index = NA_integer_,
+                              district_row = NULL,
+                              numero_postulacion = NA_character_,
+                              nombre = NA_character_,
+                              dni_listado = NA_character_,
+                              partido_politico = NA_character_,
+                              cargo_postula = NA_character_,
+                              type = NA_character_,
+                              estado_inadmisible = NA_character_,
+                              url_imagen = NA_character_,
+                              url_logo_partido = NA_character_,
+                              url_hoja_vida = NA_character_,
+                              card_html = NA_character_) {
+  tibble::tibble(
+    card_index = suppressWarnings(as.integer(card_index)),
+    codigo_distrito_electoral = row_value_or_na(district_row, "codigo_distrito_electoral"),
+    distrito_electoral = row_value_or_na(district_row, "distrito_electoral"),
+    numero_postulacion = coalesce_chr(numero_postulacion),
+    nombre = coalesce_chr(nombre),
+    dni_listado = coalesce_chr(dni_listado),
+    partido_politico = coalesce_chr(partido_politico),
+    cargo_postula = coalesce_chr(cargo_postula, row_value_or_na(district_row, "cargo_postula")),
+    type = coalesce_chr(type, row_value_or_na(district_row, "type")),
+    estado_inadmisible = coalesce_chr(estado_inadmisible),
+    url_imagen = coalesce_chr(url_imagen),
+    url_logo_partido = coalesce_chr(url_logo_partido),
+    url_hoja_vida = coalesce_chr(url_hoja_vida),
+    card_html = coalesce_chr(card_html)
+  )
+}
+
+empty_listing_rows <- function() {
+  empty_chr_tibble(listing_output_columns)
+}
+
+normalize_cargo_postula <- function(label) {
+  label <- value_or_na(label)
+
+  if (is.na(label)) {
+    return(NA_character_)
+  }
+
+  cleaned <- label %>%
+    stringr::str_replace(
+      stringr::regex("^candidat[oa]\\s+a(?:l)?\\s+", ignore_case = TRUE),
+      ""
+    ) %>%
+    stringr::str_squish()
+
+  if (is.na(value_or_na(cleaned))) {
+    cleaned <- label
+  }
+
+  stringr::str_to_upper(cleaned, locale = "es")
+}
+
+derive_candidate_type <- function(cargo_postula, fallback = NA_character_) {
+  cargo_key <- clean_name_es(cargo_postula)
+
+  if (!is.na(cargo_key) && grepl("vicepresident", cargo_key)) {
+    return("Vicepresidente")
+  }
+
+  if (!is.na(cargo_key) && grepl("president", cargo_key)) {
+    return("Presidente")
+  }
+
+  if (!is.na(cargo_key) && grepl("senador", cargo_key)) {
+    return("Senador")
+  }
+
+  if (!is.na(cargo_key) && grepl("diputad", cargo_key)) {
+    return("Diputado")
+  }
+
+  value_or_na(fallback)
+}
+
+extract_profile_role_label <- function(page) {
+  h1_node <- rvest::html_element(page, "main h1")
+
+  if (length(h1_node) == 0 || inherits(h1_node, "xml_missing")) {
+    return(NA_character_)
+  }
+
+  containers <- list(h1_node)
+  current_node <- h1_node
+
+  for (depth_idx in seq_len(3)) {
+    current_node <- xml2::xml_parent(current_node)
+
+    if (length(current_node) == 0 || inherits(current_node, "xml_missing")) {
+      break
+    }
+
+    containers[[length(containers) + 1L]] <- current_node
+  }
+
+  role_lines <- purrr::map_chr(containers, function(node) {
+    p_nodes <- rvest::html_elements(node, "p")
+
+    if (length(p_nodes) == 0) {
+      return(NA_character_)
+    }
+
+    paste(compact_lines(purrr::map_chr(p_nodes, safe_html_text)), collapse = " | ")
+  })
+
+  role_lines <- compact_lines(unlist(strsplit(role_lines, "\\|", perl = TRUE), use.names = FALSE))
+  role_lines <- role_lines[role_lines != safe_html_text(h1_node)]
+
+  if (length(role_lines) == 0) {
+    return(NA_character_)
+  }
+
+  role_match <- role_lines[vapply(role_lines, function(line_value) {
+    line_ascii <- tolower(iconv(line_value, to = "ASCII//TRANSLIT"))
+    grepl("candidat[oa]\\s+a|presidente|vicepresidente|senador|diputad", line_ascii, perl = TRUE)
+  }, logical(1))]
+
+  value_or_na(role_match[1])
+}
+
+resolve_profile_role_metadata <- function(page, listing_row = NULL) {
+  cargo_postula <- coalesce_chr(
+    normalize_cargo_postula(extract_profile_role_label(page)),
+    normalize_cargo_postula(row_value_or_na(listing_row, "cargo_postula"))
+  )
+
+  list(
+    cargo_postula = cargo_postula,
+    type = coalesce_chr(
+      derive_candidate_type(cargo_postula),
+      row_value_or_na(listing_row, "type")
+    )
+  )
 }
 
 extract_listing_cards <- function(page, district_row) {
@@ -780,10 +1052,9 @@ extract_listing_cards <- function(page, district_row) {
           )
         )
 
-        tibble::tibble(
-          card_index = as.integer(idx),
-          codigo_distrito_electoral = district_row$codigo_distrito_electoral,
-          distrito_electoral = district_row$distrito_electoral,
+        build_listing_row(
+          card_index = idx,
+          district_row = district_row,
           numero_postulacion = NA_character_,
           nombre = candidate_name,
           dni_listado = dni_listado,
@@ -800,20 +1071,7 @@ extract_listing_cards <- function(page, district_row) {
     link_nodes <- rvest::html_elements(page, "a[href*='/hoja-vida/']")
 
     if (length(link_nodes) == 0) {
-      return(tibble::tibble(
-        card_index = integer(),
-        codigo_distrito_electoral = character(),
-        distrito_electoral = character(),
-        numero_postulacion = character(),
-        nombre = character(),
-        dni_listado = character(),
-        partido_politico = character(),
-        estado_inadmisible = character(),
-        url_imagen = character(),
-        url_logo_partido = character(),
-        url_hoja_vida = character(),
-        card_html = character()
-      ))
+      return(empty_listing_rows())
     }
 
     link_hrefs <- purrr::map_chr(link_nodes, ~ value_or_na(rvest::html_attr(.x, "href")))
@@ -835,10 +1093,9 @@ extract_listing_cards <- function(page, district_row) {
       party_name <- if (length(card_text) >= 2) value_or_na(card_text[length(card_text)]) else NA_character_
       candidate_image <- safe_html_attr(rvest::html_element(card, "img"), "src")
 
-      tibble::tibble(
-        card_index = as.integer(idx),
-        codigo_distrito_electoral = district_row$codigo_distrito_electoral,
-        distrito_electoral = district_row$distrito_electoral,
+      build_listing_row(
+        card_index = idx,
+        district_row = district_row,
         numero_postulacion = NA_character_,
         nombre = candidate_name,
         dni_listado = value_or_na(stringr::str_match(safe_html_text(card), "DNI\\s*:?\\s*([0-9]{7,10})")[, 2]),
@@ -883,10 +1140,9 @@ extract_listing_cards <- function(page, district_row) {
       )
     )
 
-    tibble::tibble(
-      card_index = as.integer(idx),
-      codigo_distrito_electoral = district_row$codigo_distrito_electoral,
-      distrito_electoral = district_row$distrito_electoral,
+    build_listing_row(
+      card_index = idx,
+      district_row = district_row,
       numero_postulacion = safe_html_text(rvest::html_element(card, ".numero-postulacion")),
       nombre = candidate_name,
       dni_listado = dni_listado,
@@ -895,6 +1151,50 @@ extract_listing_cards <- function(page, district_row) {
       url_imagen = make_absolute_url(candidate_image),
       url_logo_partido = party_logo_url,
       url_hoja_vida = profile_url,
+      card_html = card_html
+    )
+  })
+}
+
+extract_formula_candidate_cards <- function(page, district_row) {
+  cards <- rvest::html_elements(
+    page,
+    "div.bg-white.border.border-gray-200.rounded-lg.p-4.shadow-sm.w-64.text-center.cursor-pointer"
+  )
+
+  if (length(cards) == 0) {
+    return(empty_listing_rows())
+  }
+
+  heading_candidates <- compact_lines(c(
+    safe_html_text(rvest::html_element(page, "main h1")),
+    safe_html_text(rvest::html_element(page, "main h2"))
+  ))
+  heading_candidates <- heading_candidates[
+    !grepl("formula_presidencial|resumen_de_plan_de_gobierno", clean_name_es(heading_candidates))
+  ]
+  party_name <- value_or_na(heading_candidates[1])
+
+  purrr::imap_dfr(cards, function(card, idx) {
+    card_html <- as.character(card)
+    cargo_postula <- normalize_cargo_postula(safe_html_text(rvest::html_element(card, "p")))
+
+    build_listing_row(
+      card_index = idx,
+      district_row = district_row,
+      numero_postulacion = coalesce_chr(
+        safe_html_text(rvest::html_element(card, ".numero-postulacion-form")),
+        as.character(idx)
+      ),
+      nombre = safe_html_text(rvest::html_element(card, "h3")),
+      dni_listado = NA_character_,
+      partido_politico = party_name,
+      cargo_postula = cargo_postula,
+      type = derive_candidate_type(cargo_postula),
+      estado_inadmisible = NA_character_,
+      url_imagen = make_absolute_url(safe_html_attr(rvest::html_element(card, "img"), "src")),
+      url_logo_partido = NA_character_,
+      url_hoja_vida = NA_character_,
       card_html = card_html
     )
   })
@@ -933,39 +1233,126 @@ extract_label_value_rows <- function(container_node) {
 extract_profile_key_values <- function(page) {
   sections <- extract_section_nodes(page)
   general_section <- sections[["informacion_general"]]
+  summary_node <- extract_profile_summary_node(page)
+
+  summary_kv <- if (length(summary_node) == 0 || inherits(summary_node, "xml_missing")) {
+    tibble::tibble(label = character(), value = character(), label_clean = character())
+  } else {
+    summary_rows <- rvest::html_elements(summary_node, "div.grid div.flex.gap-2")
+
+    if (length(summary_rows) == 0) {
+      tibble::tibble(label = character(), value = character(), label_clean = character())
+    } else {
+      purrr::map_dfr(summary_rows, function(row_node) {
+        spans <- compact_lines(purrr::map_chr(rvest::html_elements(row_node, "span"), safe_html_text))
+
+        if (length(spans) < 2) {
+          return(tibble::tibble(
+            label = character(),
+            value = character(),
+            label_clean = character()
+          ))
+        }
+
+        label_value <- value_or_na(spans[1])
+        value_value <- value_or_na(spans[length(spans)])
+
+        if (is.na(label_value) || is.na(value_value)) {
+          return(tibble::tibble(
+            label = character(),
+            value = character(),
+            label_clean = character()
+          ))
+        }
+
+        tibble::tibble(
+          label = label_value,
+          value = value_value,
+          label_clean = clean_name_es(label_value)
+        )
+      })
+    }
+  }
 
   if (is.null(general_section)) {
-    return(tibble::tibble(label = character(), value = character(), label_clean = character()))
+    return(summary_kv)
   }
 
   kv_table <- extract_label_value_rows(general_section$node)
 
   if (nrow(kv_table) == 0) {
-    return(tibble::tibble(label = character(), value = character(), label_clean = character()))
+    return(summary_kv)
   }
 
-  kv_table %>%
-    dplyr::mutate(label_clean = clean_name_es(.data$label))
+  dplyr::bind_rows(
+    kv_table %>%
+      dplyr::mutate(label_clean = clean_name_es(.data$label)),
+    summary_kv
+  ) %>%
+    dplyr::filter(!is.na(.data$label_clean)) %>%
+    dplyr::distinct(.data$label_clean, .keep_all = TRUE)
 }
 
 extract_section_nodes <- function(page) {
-  sections <- rvest::html_elements(page, "main section")
+  section_entries <- list()
+  summary_node <- extract_profile_summary_node(page)
 
-  if (length(sections) == 0) {
+  if (length(summary_node) > 0 && !inherits(summary_node, "xml_missing")) {
+    section_entries[[length(section_entries) + 1L]] <- list(
+      title = "Informacion General",
+      key = "informacion_general",
+      node = summary_node
+    )
+  }
+
+  legacy_sections <- rvest::html_elements(page, "main section")
+
+  if (length(legacy_sections) > 0) {
+    section_entries <- c(
+      section_entries,
+      purrr::map(legacy_sections, function(section_node) {
+        title <- safe_html_text(rvest::html_element(section_node, "h2"))
+
+        list(
+          title = title,
+          key = section_title_key(title),
+          node = section_node
+        )
+      })
+    )
+  }
+
+  modern_sections <- rvest::html_elements(
+    page,
+    "main div.space-y-4 > div.bg-white.border.border-gray-200.rounded-lg.shadow-sm.overflow-hidden"
+  )
+
+  if (length(modern_sections) > 0) {
+    section_entries <- c(
+      section_entries,
+      purrr::map(modern_sections, function(section_node) {
+        title <- safe_html_text(rvest::html_element(section_node, "button"))
+
+        list(
+          title = title,
+          key = section_title_key(title),
+          node = section_node
+        )
+      })
+    )
+  }
+
+  if (length(section_entries) == 0) {
     return(list())
   }
 
-  named_sections <- purrr::map(sections, function(section_node) {
-    title <- safe_html_text(rvest::html_element(section_node, "h2"))
+  keys <- purrr::map_chr(section_entries, "key")
+  valid_idx <- !is.na(keys) & nzchar(keys)
 
-    list(
-      title = title,
-      key = section_title_key(title),
-      node = section_node
-    )
-  })
+  section_entries <- section_entries[valid_idx]
+  keys <- keys[valid_idx]
 
-  stats::setNames(named_sections, purrr::map_chr(named_sections, "key"))
+  stats::setNames(section_entries, keys)
 }
 
 section_has_no_info <- function(section_node) {
@@ -989,24 +1376,78 @@ build_detail_value <- function(values) {
   paste(values, collapse = " | ")
 }
 
+extract_table_header_keys <- function(table_node) {
+  headers <- compact_lines(purrr::map_chr(rvest::html_elements(table_node, "thead th"), safe_html_text))
+  clean_name_es(headers)
+}
+
+extract_table_cell_value <- function(cells, header_keys, patterns, default_index = NA_integer_) {
+  cells <- as.character(cells)
+  header_keys <- as.character(header_keys)
+
+  if (length(header_keys) > 0) {
+    match_idx <- which(vapply(header_keys, function(header_key) {
+      any(vapply(patterns, function(pattern_value) {
+        grepl(pattern_value, header_key, perl = TRUE)
+      }, logical(1)))
+    }, logical(1)))
+
+    if (length(match_idx) > 0 && length(cells) >= match_idx[[1]]) {
+      return(value_or_na(cells[match_idx[[1]]]))
+    }
+  }
+
+  if (!is.na(default_index) && length(cells) >= default_index) {
+    return(value_or_na(cells[default_index]))
+  }
+
+  NA_character_
+}
+
 extract_heading_blocks <- function(section_node) {
   heading_nodes <- rvest::html_elements(section_node, "h4")
 
-  if (length(heading_nodes) == 0) {
+  if (length(heading_nodes) > 0) {
+    blocks <- purrr::map(heading_nodes, function(heading_node) {
+      title <- safe_html_text(heading_node)
+
+      list(
+        title = title,
+        key = clean_name_es(title),
+        node = xml2::xml_parent(heading_node)
+      )
+    })
+
+    return(stats::setNames(blocks, purrr::map_chr(blocks, "key")))
+  }
+
+  subsection_nodes <- rvest::html_elements(section_node, "div.p-0-1 > div")
+
+  if (length(subsection_nodes) == 0) {
     return(list())
   }
 
-  blocks <- purrr::map(heading_nodes, function(heading_node) {
-    title <- safe_html_text(heading_node)
+  blocks <- purrr::map(subsection_nodes, function(subsection_node) {
+    title <- coalesce_chr(
+      safe_html_text(rvest::html_element(subsection_node, "#content-cargos-partidarios")),
+      safe_html_text(rvest::html_element(subsection_node, "#content-eleccion-popular")),
+      safe_html_text(rvest::html_element(subsection_node, "div.w-full.bg-gray-400.text-white.text-center"))
+    )
 
     list(
       title = title,
-      key = clean_name_es(title),
-      node = xml2::xml_parent(heading_node)
+      key = section_title_key(title),
+      node = subsection_node
     )
   })
 
-  stats::setNames(blocks, purrr::map_chr(blocks, "key"))
+  keys <- purrr::map_chr(blocks, "key")
+  valid_idx <- !is.na(keys) & nzchar(keys)
+
+  blocks <- blocks[valid_idx]
+  keys <- keys[valid_idx]
+
+  stats::setNames(blocks, keys)
 }
 
 find_heading_block <- function(section_node, patterns) {
@@ -1030,16 +1471,55 @@ find_heading_block <- function(section_node, patterns) {
   blocks[[matched_idx[[1]]]]
 }
 
-extract_education_basic_value <- function(section_node) {
+extract_education_basic_values <- function(section_node) {
+  out <- list(
+    cuenta = NA_character_,
+    primaria = NA_character_,
+    secundaria = NA_character_
+  )
+
   section_text <- safe_html_text(section_node)
 
   if (is.na(section_text)) {
-    return(NA_character_)
+    return(out)
+  }
+
+  row_nodes <- rvest::html_elements(section_node, "div.flex.justify-between")
+
+  if (length(row_nodes) > 0) {
+    parsed_rows <- purrr::map_dfr(row_nodes, function(row_node) {
+      spans <- compact_lines(purrr::map_chr(rvest::html_elements(row_node, "span"), safe_html_text))
+
+      if (length(spans) < 2) {
+        return(tibble::tibble(label = character(), value = character()))
+      }
+
+      tibble::tibble(
+        label = value_or_na(spans[1]),
+        value = value_or_na(spans[length(spans)])
+      )
+    })
+
+    if (nrow(parsed_rows) > 0) {
+      label_keys <- clean_name_es(parsed_rows$label)
+      out$cuenta <- value_or_na(parsed_rows$value[grepl("educacion_basica", label_keys)][1])
+      out$primaria <- value_or_na(parsed_rows$value[grepl("^primaria$", label_keys)][1])
+      out$secundaria <- value_or_na(parsed_rows$value[grepl("^secundaria$", label_keys)][1])
+    }
+  }
+
+  if (!is.na(out$cuenta)) {
+    return(out)
   }
 
   section_ascii <- iconv(section_text, to = "ASCII//TRANSLIT")
   matched <- stringr::str_match(section_ascii, "Educacion Basica\\s*:?\\s*(SI|NO)")
-  value_or_na(matched[, 2])
+  out$cuenta <- value_or_na(matched[, 2])
+  out
+}
+
+extract_education_basic_value <- function(section_node) {
+  extract_education_basic_values(section_node)$cuenta
 }
 
 empty_study_rows <- function() {
@@ -1140,6 +1620,64 @@ extract_study_rows_from_block <- function(block_node, id_candidato) {
     return(empty_study_rows())
   }
 
+  table_node <- rvest::html_element(block_node, "table")
+
+  if (length(table_node) > 0 && !inherits(table_node, "xml_missing")) {
+    header_keys <- extract_table_header_keys(table_node)
+    row_nodes <- rvest::html_elements(table_node, "tbody tr")
+
+    if (length(row_nodes) > 0) {
+      parsed_rows <- purrr::map_dfr(row_nodes, function(row_node) {
+        cells <- compact_lines(purrr::map_chr(rvest::html_elements(row_node, "th, td"), safe_html_text))
+        detail_value <- build_detail_value(cells)
+
+        if (is.na(detail_value)) {
+          return(empty_study_rows())
+        }
+
+        tibble::tibble(
+          id_candidato = id_candidato,
+          estudio = extract_table_cell_value(
+            cells,
+            header_keys,
+            c("^especialidad$", "^estudio$", "^carrera$", "^profesion$"),
+            default_index = if (length(cells) >= 5) 2L else NA_integer_
+          ),
+          institucion = extract_table_cell_value(
+            cells,
+            header_keys,
+            c("^universidad$", "^institucion$", "^centro_de_estudio$", "^centro_de_formacion$"),
+            default_index = 1L
+          ),
+          grado = extract_table_cell_value(
+            cells,
+            header_keys,
+            c("^grado$"),
+            default_index = if (length(cells) >= 4) 3L else NA_integer_
+          ),
+          condicion = extract_table_cell_value(
+            cells,
+            header_keys,
+            c("^concluido$", "^condicion$"),
+            default_index = if (length(cells) >= 4) 2L else NA_integer_
+          ),
+          anio = extract_table_cell_value(
+            cells,
+            header_keys,
+            c("^ano_de_obtencion$", "^ano$"),
+            default_index = if (length(cells) >= 4) 4L else NA_integer_
+          ),
+          detalle_original = detail_value
+        )
+      }) %>%
+        dplyr::filter(!is.na(.data$detalle_original))
+
+      if (nrow(parsed_rows) > 0) {
+        return(parsed_rows)
+      }
+    }
+  }
+
   card_nodes <- rvest::html_elements(block_node, "div.bg-gray-50.p-4.rounded-lg.border")
 
   if (length(card_nodes) > 0) {
@@ -1161,6 +1699,52 @@ empty_experience_rows <- function() {
 extract_experience_rows <- function(section_node, id_candidato) {
   if (is.null(section_node) || inherits(section_node, "xml_missing") || section_has_no_info(section_node)) {
     return(empty_experience_rows())
+  }
+
+  table_node <- rvest::html_element(section_node, "table")
+
+  if (length(table_node) > 0 && !inherits(table_node, "xml_missing")) {
+    header_keys <- extract_table_header_keys(table_node)
+    row_nodes <- rvest::html_elements(table_node, "tbody tr")
+
+    if (length(row_nodes) > 0) {
+      parsed_rows <- purrr::map_dfr(row_nodes, function(row_node) {
+        cells <- compact_lines(purrr::map_chr(rvest::html_elements(row_node, "th, td"), safe_html_text))
+        detail_value <- build_detail_value(cells)
+
+        if (is.na(detail_value)) {
+          return(empty_experience_rows())
+        }
+
+        tibble::tibble(
+          id_candidato = id_candidato,
+          entidad = extract_table_cell_value(
+            cells,
+            header_keys,
+            c("^centro_de_trabajo$", "^entidad$", "^institucion$"),
+            default_index = 1L
+          ),
+          cargo = extract_table_cell_value(
+            cells,
+            header_keys,
+            c("^ocupacion$", "^cargo$"),
+            default_index = 2L
+          ),
+          periodo = extract_table_cell_value(
+            cells,
+            header_keys,
+            c("^periodo$"),
+            default_index = 3L
+          ),
+          detalle_original = detail_value
+        )
+      }) %>%
+        dplyr::filter(!is.na(.data$detalle_original))
+
+      if (nrow(parsed_rows) > 0) {
+        return(parsed_rows)
+      }
+    }
   }
 
   row_nodes <- rvest::html_elements(section_node, "div.flex.items-start")
@@ -1197,6 +1781,52 @@ extract_trayectoria_rows_from_block <- function(block_node, id_candidato) {
     return(empty_trayectoria_rows())
   }
 
+  table_node <- rvest::html_element(block_node, "table")
+
+  if (length(table_node) > 0 && !inherits(table_node, "xml_missing")) {
+    header_keys <- extract_table_header_keys(table_node)
+    row_nodes <- rvest::html_elements(table_node, "tbody tr")
+
+    if (length(row_nodes) > 0) {
+      parsed_rows <- purrr::map_dfr(row_nodes, function(row_node) {
+        cells <- compact_lines(purrr::map_chr(rvest::html_elements(row_node, "th, td"), safe_html_text))
+        detail_value <- build_detail_value(cells)
+
+        if (is.na(detail_value)) {
+          return(empty_trayectoria_rows())
+        }
+
+        tibble::tibble(
+          id_candidato = id_candidato,
+          cargo = extract_table_cell_value(
+            cells,
+            header_keys,
+            c("^cargo$"),
+            default_index = if (length(cells) >= 2) 2L else 1L
+          ),
+          organizacion = extract_table_cell_value(
+            cells,
+            header_keys,
+            c("^organizacion_politica$", "^organizacion$"),
+            default_index = 1L
+          ),
+          periodo = extract_table_cell_value(
+            cells,
+            header_keys,
+            c("^periodo$"),
+            default_index = 3L
+          ),
+          detalle_original = detail_value
+        )
+      }) %>%
+        dplyr::filter(!is.na(.data$detalle_original))
+
+      if (nrow(parsed_rows) > 0) {
+        return(parsed_rows)
+      }
+    }
+  }
+
   card_nodes <- rvest::html_elements(block_node, "div.bg-gray-50.p-4.rounded-lg.border")
 
   if (length(card_nodes) == 0) {
@@ -1230,6 +1860,36 @@ empty_sentence_rows <- function() {
 extract_sentence_rows <- function(section_node, id_candidato) {
   if (is.null(section_node) || inherits(section_node, "xml_missing") || section_has_no_info(section_node)) {
     return(empty_sentence_rows())
+  }
+
+  table_node <- rvest::html_element(section_node, "table")
+
+  if (length(table_node) > 0 && !inherits(table_node, "xml_missing")) {
+    row_nodes <- rvest::html_elements(table_node, "tbody tr")
+
+    if (length(row_nodes) > 0) {
+      parsed_rows <- purrr::map_dfr(row_nodes, function(row_node) {
+        cells <- compact_lines(purrr::map_chr(rvest::html_elements(row_node, "th, td"), safe_html_text))
+        detail_value <- build_detail_value(cells)
+
+        if (is.na(detail_value)) {
+          return(empty_sentence_rows())
+        }
+
+        tibble::tibble(
+          id_candidato = id_candidato,
+          tipo_sentencia = NA_character_,
+          materia = value_or_na(cells[1]),
+          resultado = value_or_na(cells[2]),
+          detalle_original = detail_value
+        )
+      }) %>%
+        dplyr::filter(!is.na(.data$detalle_original))
+
+      if (nrow(parsed_rows) > 0) {
+        return(parsed_rows)
+      }
+    }
   }
 
   blocks <- extract_heading_blocks(section_node)
@@ -1279,39 +1939,71 @@ extract_income_values <- function(section_node) {
 
   table_node <- rvest::html_element(section_node, "table")
 
-  if (length(table_node) == 0 || inherits(table_node, "xml_missing")) {
-    return(empty_values)
-  }
+  parsed_rows <- tibble::tibble(
+    descripcion = character(),
+    sector_publico = character(),
+    sector_privado = character(),
+    total = character()
+  )
 
-  row_nodes <- rvest::html_elements(table_node, "tbody tr")
+  if (length(table_node) > 0 && !inherits(table_node, "xml_missing")) {
+    row_nodes <- rvest::html_elements(table_node, "tbody tr")
 
-  if (length(row_nodes) == 0) {
-    return(empty_values)
-  }
+    if (length(row_nodes) > 0) {
+      parsed_rows <- purrr::map_dfr(row_nodes, function(row_node) {
+        cells <- rvest::html_elements(row_node, "th, td")
+        cell_texts <- purrr::map_chr(cells, safe_html_text)
 
-  parsed_rows <- purrr::map_dfr(row_nodes, function(row_node) {
-    cells <- rvest::html_elements(row_node, "th, td")
-    cell_texts <- purrr::map_chr(cells, safe_html_text)
+        if (length(cell_texts) < 4) {
+          return(tibble::tibble(
+            descripcion = character(),
+            sector_publico = character(),
+            sector_privado = character(),
+            total = character()
+          ))
+        }
 
-    if (length(cell_texts) < 4) {
-      return(tibble::tibble(
-        descripcion = character(),
-        sector_publico = character(),
-        sector_privado = character(),
-        total = character()
-      ))
+        tibble::tibble(
+          descripcion = value_or_na(cell_texts[1]),
+          sector_publico = value_or_na(cell_texts[2]),
+          sector_privado = value_or_na(cell_texts[3]),
+          total = value_or_na(cell_texts[4])
+        )
+      })
     }
-
-    tibble::tibble(
-      descripcion = value_or_na(cell_texts[1]),
-      sector_publico = value_or_na(cell_texts[2]),
-      sector_privado = value_or_na(cell_texts[3]),
-      total = value_or_na(cell_texts[4])
-    )
-  })
+  }
 
   if (nrow(parsed_rows) == 0) {
-    return(empty_values)
+    row_nodes <- rvest::html_elements(section_node, "div.grid.grid-cols-2")
+
+    if (length(row_nodes) == 0) {
+      return(empty_values)
+    }
+
+    simple_rows <- purrr::map_dfr(row_nodes, function(row_node) {
+      spans <- compact_lines(purrr::map_chr(rvest::html_elements(row_node, "span"), safe_html_text))
+
+      if (length(spans) < 2) {
+        return(tibble::tibble(descripcion = character(), valor = character()))
+      }
+
+      tibble::tibble(
+        descripcion = value_or_na(spans[1]),
+        valor = value_or_na(spans[length(spans)])
+      )
+    })
+
+    if (nrow(simple_rows) == 0) {
+      return(empty_values)
+    }
+
+    descripcion_ascii <- iconv(simple_rows$descripcion, to = "ASCII//TRANSLIT")
+
+    return(list(
+      remuneracion_bruta_publico = value_or_na(simple_rows$valor[grepl("Remuneracion Bruta Publico", descripcion_ascii, ignore.case = TRUE)][1]),
+      remuneracion_bruta_privado = value_or_na(simple_rows$valor[grepl("Remuneracion Bruta Privado", descripcion_ascii, ignore.case = TRUE)][1]),
+      total_ingresos = value_or_na(simple_rows$valor[grepl("Total Ingresos", descripcion_ascii, ignore.case = TRUE)][1])
+    ))
   }
 
   descripcion_ascii <- iconv(parsed_rows$descripcion, to = "ASCII//TRANSLIT")
@@ -1332,6 +2024,37 @@ empty_asset_rows <- function() {
 extract_asset_rows <- function(section_node, id_candidato) {
   if (is.null(section_node) || inherits(section_node, "xml_missing") || section_has_no_info(section_node)) {
     return(empty_asset_rows())
+  }
+
+  table_node <- rvest::html_element(section_node, "table")
+
+  if (length(table_node) > 0 && !inherits(table_node, "xml_missing")) {
+    row_nodes <- rvest::html_elements(table_node, "tbody tr")
+
+    if (length(row_nodes) > 0) {
+      parsed_rows <- purrr::map_dfr(row_nodes, function(row_node) {
+        cells <- compact_lines(purrr::map_chr(rvest::html_elements(row_node, "th, td"), safe_html_text))
+        detail_value <- build_detail_value(cells)
+
+        if (is.na(detail_value)) {
+          return(empty_asset_rows())
+        }
+
+        tibble::tibble(
+          id_candidato = id_candidato,
+          tipo_bien = value_or_na(cells[1]),
+          descripcion = value_or_na(cells[2]),
+          detalle = NA_character_,
+          valor = value_or_na(cells[3]),
+          detalle_original = detail_value
+        )
+      }) %>%
+        dplyr::filter(!is.na(.data$detalle_original))
+
+      if (nrow(parsed_rows) > 0) {
+        return(parsed_rows)
+      }
+    }
   }
 
   blocks <- extract_heading_blocks(section_node)
@@ -1479,17 +2202,46 @@ extract_profile_photo_url <- function(page) {
 }
 
 extract_profile_logo_url <- function(page) {
-  logo_img <- safe_html_attr(rvest::html_element(page, "main img[alt='Logo partido']"), "src")
+  summary_node <- extract_profile_summary_node(page)
+  logo_img <- coalesce_chr(
+    safe_html_attr(rvest::html_element(summary_node, "img[src*='LogoOp/']"), "src"),
+    safe_html_attr(rvest::html_element(page, "main img[alt='Logo partido']"), "src"),
+    safe_html_attr(rvest::html_element(page, "main img[alt='Logo Partido']"), "src")
+  )
   make_absolute_url(logo_img)
 }
 
-derive_candidate_ids <- function(url_hoja_vida) {
+build_candidate_record_id <- function(partido_id, dni, type = NA_character_, target_slug = NA_character_) {
+  partido_id <- value_or_na(partido_id)
+  dni <- value_or_na(dni)
+
+  if (is.na(partido_id) || is.na(dni)) {
+    return(NA_character_)
+  }
+
+  type_slug <- slugify_path(type)
+
+  if (!is.na(type_slug) && nzchar(type_slug)) {
+    return(paste(partido_id, dni, type_slug, sep = "_"))
+  }
+
+  target_slug <- slugify_path(target_slug)
+
+  if (!is.na(target_slug) && nzchar(target_slug)) {
+    return(paste(partido_id, dni, target_slug, sep = "_"))
+  }
+
+  paste(partido_id, dni, sep = "_")
+}
+
+derive_candidate_ids <- function(url_hoja_vida, type = NA_character_, target_slug = NA_character_) {
   matched <- stringr::str_match(url_hoja_vida, "/hoja-vida/([0-9]+)/([0-9]+)")
 
   if (nrow(matched) == 0 || all(is.na(matched[1, ]))) {
     return(list(
       partido_id = NA_character_,
       dni = NA_character_,
+      person_id = NA_character_,
       id_candidato = NA_character_
     ))
   }
@@ -1511,14 +2263,25 @@ derive_candidate_ids <- function(url_hoja_vida) {
   list(
     partido_id = partido_id,
     dni = dni,
-    id_candidato = paste(partido_id, dni, sep = "_")
+    person_id = paste(partido_id, dni, sep = "_"),
+    id_candidato = build_candidate_record_id(
+      partido_id,
+      dni,
+      type = type,
+      target_slug = target_slug
+    )
   )
 }
 
 parse_candidate_profile <- function(page, listing_row, district_row, url_hoja_vida) {
-  ids <- derive_candidate_ids(url_hoja_vida)
+  ids <- derive_candidate_ids(
+    url_hoja_vida,
+    type = row_value_or_na(listing_row, "type"),
+    target_slug = row_value_or_na(district_row, "target_slug")
+  )
   profile_kv <- extract_profile_key_values(page)
   sections <- extract_section_nodes(page)
+  role_metadata <- resolve_profile_role_metadata(page, listing_row)
 
   top_lookup <- as.list(stats::setNames(profile_kv$value, profile_kv$label_clean))
   income_values <- list(
@@ -1528,6 +2291,7 @@ parse_candidate_profile <- function(page, listing_row, district_row, url_hoja_vi
   )
 
   education_section <- sections[["formacion_academica"]]
+  basic_section <- sections[["educacion_basica"]]
   income_section <- sections[["ingreso_de_bienes_y_rentas"]]
   trajectory_section <- sections[["trayectoria_politica"]]
   sentences_section <- sections[["declaracion_de_sentencias_firmes"]]
@@ -1535,7 +2299,17 @@ parse_candidate_profile <- function(page, listing_row, district_row, url_hoja_vi
   additional_section <- sections[["informacion_adicional"]]
   annotation_section <- sections[["anotacion_marginal"]]
 
-  basic_value <- if (!is.null(education_section)) extract_education_basic_value(education_section$node) else NA_character_
+  basic_values <- if (!is.null(basic_section)) {
+    extract_education_basic_values(basic_section$node)
+  } else if (!is.null(education_section)) {
+    extract_education_basic_values(education_section$node)
+  } else {
+    list(
+      cuenta = NA_character_,
+      primaria = NA_character_,
+      secundaria = NA_character_
+    )
+  }
 
   if (!is.null(income_section)) {
     income_values <- extract_income_values(income_section$node)
@@ -1554,28 +2328,46 @@ parse_candidate_profile <- function(page, listing_row, district_row, url_hoja_vi
     extract_party_id_from_logo_url(row_value_or_na(listing_row, "url_logo_partido"))
   )
   ids$dni <- coalesce_chr(top_lookup[["dni"]], ids$dni, row_value_or_na(listing_row, "dni_listado"))
+  ids$person_id <- if (!is.na(ids$partido_id) && !is.na(ids$dni)) {
+    paste(ids$partido_id, ids$dni, sep = "_")
+  } else {
+    ids$person_id
+  }
   ids$id_candidato <- coalesce_chr(
-    ids$id_candidato,
-    if (!is.na(ids$partido_id) && !is.na(ids$dni)) paste(ids$partido_id, ids$dni, sep = "_") else NA_character_
+    build_candidate_record_id(
+      ids$partido_id,
+      ids$dni,
+      type = role_metadata$type,
+      target_slug = row_value_or_na(district_row, "target_slug")
+    ),
+    ids$id_candidato
   )
 
   estudios_tecnicos_block <- if (!is.null(education_section)) {
     find_heading_block(education_section$node, c("estudios_tecnicos"))
+  } else if (!is.null(sections[["estudios_tecnicos"]])) {
+    sections[["estudios_tecnicos"]]
   } else {
     NULL
   }
   estudios_no_universitarios_block <- if (!is.null(education_section)) {
     find_heading_block(education_section$node, c("estudios_no_universitarios", "no_universitarios"))
+  } else if (!is.null(sections[["estudios_no_universitarios"]])) {
+    sections[["estudios_no_universitarios"]]
   } else {
     NULL
   }
   estudios_universitarios_block <- if (!is.null(education_section)) {
     find_heading_block(education_section$node, c("estudios_universitarios"))
+  } else if (!is.null(sections[["estudios_universitarios"]])) {
+    sections[["estudios_universitarios"]]
   } else {
     NULL
   }
   estudios_posgrado_block <- if (!is.null(education_section)) {
     find_heading_block(education_section$node, c("estudios_de_posgrado", "estudios_posgrado"))
+  } else if (!is.null(sections[["estudios_posgrado"]])) {
+    sections[["estudios_posgrado"]]
   } else {
     NULL
   }
@@ -1595,10 +2387,11 @@ parse_candidate_profile <- function(page, listing_row, district_row, url_hoja_vi
     partido_id = ids$partido_id,
     codigo_distrito_electoral = district_row$codigo_distrito_electoral,
     distrito_electoral = district_row$distrito_electoral,
-    cargo_postula = "DIPUTADOS",
+    cargo_postula = role_metadata$cargo_postula,
+    type = role_metadata$type,
     dni = ids$dni,
     nombre = coalesce_chr(
-      safe_html_text(rvest::html_element(page, "main h1")),
+      extract_profile_name(page),
       row_value_or_na(listing_row, "nombre")
     ),
     partido_politico = coalesce_chr(top_lookup[["organizacion_politica"]], row_value_or_na(listing_row, "partido_politico")),
@@ -1611,9 +2404,9 @@ parse_candidate_profile <- function(page, listing_row, district_row, url_hoja_vi
     url_imagen = image_url,
     ruta_imagen = NA_character_,
     url_logo_partido = logo_url,
-    educacion_basica_cuenta = basic_value,
-    educacion_basica_primaria = NA_character_,
-    educacion_basica_secundaria = NA_character_,
+    educacion_basica_cuenta = basic_values$cuenta,
+    educacion_basica_primaria = basic_values$primaria,
+    educacion_basica_secundaria = basic_values$secundaria,
     ingresos_remuneracion_bruta_publico = income_values$remuneracion_bruta_publico,
     ingresos_remuneracion_bruta_privado = income_values$remuneracion_bruta_privado,
     ingresos_total_ingresos = income_values$total_ingresos,
@@ -1953,11 +2746,14 @@ fetch_live_profile_for_image <- function(remDr,
 # ==========================================
 
 listing_snapshot_prefix <- function(district_row, suffix = NULL) {
-  prefix <- paste0(
-    district_row$codigo_distrito_electoral,
-    "_",
-    slugify_path(district_row$distrito_electoral)
+  district_row <- tibble::as_tibble(district_row)
+  prefix_parts <- c(
+    row_value_or_na(district_row, "target_slug"),
+    row_value_or_na(district_row, "codigo_distrito_electoral"),
+    slugify_path(coalesce_chr(row_value_or_na(district_row, "distrito_electoral"), "sin-distrito"))
   )
+  prefix_parts <- prefix_parts[!is.na(prefix_parts) & nzchar(prefix_parts)]
+  prefix <- paste(prefix_parts, collapse = "_")
 
   if (!is.null(suffix) && nzchar(suffix)) {
     prefix <- paste(prefix, slugify_path(suffix), sep = "_")

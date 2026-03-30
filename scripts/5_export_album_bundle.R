@@ -116,12 +116,52 @@ display_title <- function(x) {
 derive_id_from_image_file <- function(path) {
   file_name <- tools::file_path_sans_ext(basename(path))
   parts <- strsplit(file_name, "_", fixed = TRUE)[[1]]
+  known_type_tokens <- c("diputado", "senador", "presidente", "vicepresidente")
+  id_length <- if (length(parts) >= 3 && parts[3] %in% known_type_tokens) 3L else if (length(parts) >= 2) 2L else NA_integer_
 
-  if (length(parts) < 2) {
+  if (is.na(id_length)) {
     return(NA_character_)
   }
 
-  paste(parts[1:2], collapse = "_")
+  paste(parts[seq_len(id_length)], collapse = "_")
+}
+
+type_export_code <- function(type_value) {
+  type_key <- clean_name_es(type_value)
+
+  if (identical(type_key, "presidente")) {
+    return("pre")
+  }
+
+  if (identical(type_key, "vicepresidente")) {
+    return("vp")
+  }
+
+  if (identical(type_key, "senador")) {
+    return("sen")
+  }
+
+  if (identical(type_key, "diputado")) {
+    return("dip")
+  }
+
+  "cand"
+}
+
+build_export_id <- function(id_candidato, type_value = NA_character_) {
+  raw_id <- paste0("cand_", value_or_na(id_candidato))
+
+  if (!is.na(raw_id) && nchar(raw_id) <= 32L) {
+    return(raw_id)
+  }
+
+  parts <- strsplit(coalesce_chr(id_candidato), "_", fixed = TRUE)[[1]]
+
+  if (length(parts) >= 2) {
+    return(paste("cand", parts[1], parts[2], type_export_code(type_value), sep = "_"))
+  }
+
+  raw_id
 }
 
 parse_income_integer <- function(x) {
@@ -334,7 +374,7 @@ build_import_guide <- function(
   }
 
   paste(
-    "# Congress Album Export Bundle",
+    "# Candidate Album Export Bundle",
     "",
     "## Snapshot",
     paste0("- Candidates exported: `", export_count, "`"),
@@ -349,9 +389,10 @@ build_import_guide <- function(
     "- `manifests/party_manifest.csv`: party metadata with `partido_id`, display name, slug, candidate count, and `url_logo_partido`.",
     "",
     "## Field Mapping",
-    "- `id`: `dip_<id_candidato>`.",
+    "- `id`: `cand_...`, keeping the source candidate id semantics while shortening long office-aware ids to satisfy the downstream 32-character limit.",
     "- `name`, `party`, `region`: title-cased display labels derived from `output/candidatos.csv`.",
-    "- `bioShort`: `Diputados - <Region>` or `Diputados` when region is missing.",
+    "- `type`: normalized office type carried from `output/candidatos.csv`.",
+    "- `bioShort`: `<Type> - <Region>` or `<Type>` when region is missing.",
     "- `sentenciado`: `TRUE` if the candidate appears in `output/relacion_sentencias.csv`, otherwise `FALSE`.",
     "- `trabaja`: `TRUE` if the candidate appears in `output/experiencia_laboral.csv`, otherwise `FALSE`.",
     "- `ingresos`: integer soles parsed from `ingresos_total_ingresos`; blank in the manifest and `null` in JSON when missing.",
@@ -396,8 +437,59 @@ candidate_df <- candidate_df %>%
   dplyr::filter(!is.na(.data$id_candidato)) %>%
   dplyr::distinct(.data$id_candidato, .keep_all = TRUE)
 
+if (!"type" %in% names(candidate_df)) {
+  candidate_df$type <- NA_character_
+}
+
+if (!"cargo_postula" %in% names(candidate_df)) {
+  candidate_df$cargo_postula <- NA_character_
+}
+
+candidate_df <- candidate_df %>%
+  dplyr::mutate(
+    type = purrr::pmap_chr(
+      list(.data$type, .data$cargo_postula),
+      function(type_value, cargo_value) {
+        coalesce_chr(type_value, derive_candidate_type(cargo_value))
+      }
+    ),
+    export_name = purrr::map_chr(.data$nombre, display_title),
+    export_party = purrr::map_chr(.data$partido_politico, display_title)
+  )
+
 if (nrow(candidate_df) == 0) {
   abort_export("No candidate rows remained after removing empty ids.")
+}
+
+incomplete_export_rows <- candidate_df %>%
+  dplyr::filter(
+    is.na(.data$export_name) |
+      is.na(.data$export_party) |
+      is.na(.data$type) |
+      !nzchar(.data$type)
+  )
+
+if (nrow(incomplete_export_rows) > 0) {
+  log_message(
+    paste(
+      "Dropping",
+      nrow(incomplete_export_rows),
+      "candidate row(s) with missing export-critical fields.",
+      "These are usually stale legacy rows kept beside newer typed records."
+    )
+  )
+}
+
+candidate_df <- candidate_df %>%
+  dplyr::filter(
+    !is.na(.data$export_name),
+    !is.na(.data$export_party),
+    !is.na(.data$type),
+    nzchar(.data$type)
+  )
+
+if (nrow(candidate_df) == 0) {
+  abort_export("No export-ready candidate rows remained after removing incomplete legacy rows.")
 }
 
 portrait_lookup <- build_portrait_lookup(IMAGE_ROOT)
@@ -428,7 +520,13 @@ if (length(missing_portraits) > 0) {
 }
 
 if (length(unknown_portraits) > 0) {
-  abort_export(paste("Portrait files were found for", length(unknown_portraits), "unknown candidate ids."))
+  log_message(
+    paste(
+      "Ignoring",
+      length(unknown_portraits),
+      "portrait file(s) that do not map to an export-ready candidate row."
+    )
+  )
 }
 
 export_df <- candidate_df %>%
@@ -439,14 +537,22 @@ export_df <- candidate_df %>%
   dplyr::left_join(work_ids, by = "id_candidato") %>%
   dplyr::left_join(qc_lookup$data, by = "id_candidato") %>%
   dplyr::mutate(
-    export_id = paste0("dip_", .data$id_candidato),
-    name = purrr::map_chr(.data$nombre, display_title),
-    party = purrr::map_chr(.data$partido_politico, display_title),
+    export_id = purrr::pmap_chr(
+      list(.data$id_candidato, .data$type),
+      build_export_id
+    ),
+    type = purrr::map_chr(.data$type, value_or_na),
+    name = .data$export_name,
+    party = .data$export_party,
     region = purrr::map_chr(.data$distrito_electoral, display_title),
     bioShort = dplyr::if_else(
-      !is.na(.data$region) & nzchar(.data$region),
-      paste0("Diputados - ", .data$region),
-      "Diputados"
+      !is.na(.data$type) & nzchar(.data$type) & !is.na(.data$region) & nzchar(.data$region),
+      paste(.data$type, .data$region, sep = " - "),
+      dplyr::if_else(
+        !is.na(.data$type) & nzchar(.data$type),
+        .data$type,
+        .data$region
+      )
     ),
     sentenciado = dplyr::coalesce(.data$has_sentence, FALSE),
     trabaja = dplyr::coalesce(.data$has_work, FALSE),
@@ -454,7 +560,7 @@ export_df <- candidate_df %>%
     stickerImage = portable_rel_path("images", "candidates", paste0(.data$export_id, ".jpg")),
     portraitImage = .data$stickerImage
   ) %>%
-  dplyr::arrange(.data$region, .data$party, .data$name, .data$id_candidato) %>%
+  dplyr::arrange(.data$region, .data$party, .data$type, .data$name, .data$id_candidato) %>%
   dplyr::mutate(sort_order = dplyr::row_number())
 
 if (nrow(export_df) != nrow(candidate_df)) {
@@ -473,6 +579,10 @@ if (any(is.na(export_df$name) | is.na(export_df$party))) {
   abort_export("At least one candidate is missing a display name or party after normalization.")
 }
 
+if (any(is.na(export_df$type) | !nzchar(export_df$type))) {
+  abort_export("At least one candidate is missing type after normalization.")
+}
+
 
 # ======================================
 # ==========  WRITE BUNDLE =============
@@ -486,6 +596,7 @@ copied_images <- copy_export_portraits(export_df)
 json_df <- export_df %>%
   dplyr::transmute(
     id = .data$export_id,
+    type = .data$type,
     name = .data$name,
     party = .data$party,
     region = .data$region,
@@ -499,9 +610,10 @@ json_df <- export_df %>%
 
 json_rows <- purrr::pmap(
   json_df,
-  function(id, name, party, region, bioShort, stickerImage, portraitImage, sentenciado, ingresos, trabaja) {
+  function(id, type, name, party, region, bioShort, stickerImage, portraitImage, sentenciado, ingresos, trabaja) {
     list(
       id = id,
+      type = type,
       name = name,
       party = party,
       region = region,
@@ -530,6 +642,7 @@ export_manifest <- export_df %>%
     id = .data$export_id,
     source_id_candidato = .data$id_candidato,
     source_partido_id = .data$partido_id,
+    type = .data$type,
     name = .data$name,
     party = .data$party,
     region = .data$region,
@@ -543,6 +656,7 @@ export_manifest <- export_df %>%
     source_url_imagen = .data$url_imagen,
     source_image_path = portable_rel_path("output", "images", .data$source_image_relative_path),
     source_raw_income_text = .data$ingresos_total_ingresos,
+    source_cargo_postula_raw = .data$cargo_postula,
     source_region_raw = .data$distrito_electoral,
     source_party_raw = .data$partido_politico,
     source_nombre_raw = .data$nombre,

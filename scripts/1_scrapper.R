@@ -31,8 +31,8 @@ PAUSE_AFTER_PAGE_LOAD <- 1
 PAUSE_AFTER_DISTRICT_CHANGE <- 1
 PAUSE_AFTER_PARTY_CLICK <- 0.5
 PAUSE_AFTER_CARD_CLICK <- 0.5
-PAUSE_BETWEEN_CANDIDATES_MIN <- 0
-PAUSE_BETWEEN_CANDIDATES_MAX <- 0
+PAUSE_BETWEEN_CANDIDATES_MIN <- 7
+PAUSE_BETWEEN_CANDIDATES_MAX <- 7
 PAUSE_BETWEEN_DISTRICTS <- 0.5
 PAUSE_AFTER_SORT_CHANGE <- 0.25
 
@@ -48,10 +48,32 @@ PROFILE_POLL_INTERVAL <- 0.5
 ## These make it easy to run smaller tests without editing the script itself.
 ENV_HEADLESS <- Sys.getenv("JNE_HEADLESS", unset = "")
 ENV_DISTRICT_FILTER <- Sys.getenv("JNE_DISTRICT_VALUES", unset = "")
+ENV_TARGETS <- Sys.getenv("JNE_TARGETS", unset = "")
 ENV_MAX_DISTRICTS <- Sys.getenv("JNE_MAX_DISTRICTS", unset = "")
 ENV_MAX_CANDIDATES_PER_DISTRICT <- Sys.getenv("JNE_MAX_CANDIDATES_PER_DISTRICT", unset = "")
 ENV_RESULTS_LOAD_TIMEOUT <- Sys.getenv("JNE_RESULTS_LOAD_TIMEOUT", unset = "")
 ENV_PROFILE_LOAD_TIMEOUT <- Sys.getenv("JNE_PROFILE_LOAD_TIMEOUT", unset = "")
+
+TARGET_CONFIGS <- list(
+  diputados = list(
+    id = "diputados",
+    label = "Diputados",
+    base_url = "https://votoinformado.jne.gob.pe/diputados",
+    embed_url = "https://votoinformadoia.jne.gob.pe/embed/diputados"
+  ),
+  `presidente-vicepresidentes` = list(
+    id = "presidente-vicepresidentes",
+    label = "Formula presidencial",
+    base_url = "https://votoinformado.jne.gob.pe/presidente-vicepresidentes"
+  ),
+  senadores = list(
+    id = "senadores",
+    label = "Senadores",
+    base_url = "https://votoinformado.jne.gob.pe/senadores"
+  )
+)
+
+TARGET_FILTER <- names(TARGET_CONFIGS)
 
 REQUIRED_PACKAGES <- c(
   "RSelenium",
@@ -105,6 +127,26 @@ if (nzchar(ENV_DISTRICT_FILTER)) {
     .[nzchar(.)]
 }
 
+if (nzchar(ENV_TARGETS)) {
+  TARGET_FILTER <- ENV_TARGETS %>%
+    strsplit(",", fixed = TRUE) %>%
+    unlist(use.names = FALSE) %>%
+    trimws() %>%
+    .[nzchar(.)]
+
+  unknown_targets <- setdiff(TARGET_FILTER, names(TARGET_CONFIGS))
+
+  if (length(unknown_targets) > 0) {
+    stop(
+      paste(
+        "Unknown JNE_TARGETS values:",
+        paste(unknown_targets, collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+}
+
 ENV_MAX_DISTRICTS <- resolve_integer_env(ENV_MAX_DISTRICTS)
 if (!is.na(ENV_MAX_DISTRICTS)) {
   MAX_DISTRICTS <- ENV_MAX_DISTRICTS
@@ -140,6 +182,141 @@ current_page_source <- function() {
 
 current_url_value <- function() {
   tryCatch(remDr$getCurrentUrl()[[1]], error = function(e) NA_character_)
+}
+
+pause_between_candidates_local <- function(card_idx, total_candidates) {
+  if (card_idx >= total_candidates) {
+    return(invisible(FALSE))
+  }
+
+  pause_min <- suppressWarnings(as.numeric(PAUSE_BETWEEN_CANDIDATES_MIN))
+  pause_max <- suppressWarnings(as.numeric(PAUSE_BETWEEN_CANDIDATES_MAX))
+
+  if (is.na(pause_min) || is.na(pause_max)) {
+    return(invisible(FALSE))
+  }
+
+  pause_floor <- max(0, min(pause_min, pause_max))
+  pause_ceiling <- max(0, max(pause_min, pause_max))
+
+  if (pause_ceiling <= 0) {
+    return(invisible(FALSE))
+  }
+
+  pause_seconds <- if (isTRUE(all.equal(pause_floor, pause_ceiling))) {
+    pause_ceiling
+  } else {
+    stats::runif(1, min = pause_floor, max = pause_ceiling)
+  }
+
+  log_message(sprintf("    Waiting %.1fs before the next candidate.", pause_seconds))
+  Sys.sleep(pause_seconds)
+
+  invisible(TRUE)
+}
+
+peru_scope_row_local <- function(target_slug, cargo_postula = NA_character_, type = NA_character_) {
+  tibble::tibble(
+    codigo_distrito_electoral = "PERU",
+    distrito_electoral = "Peru",
+    cargo_postula = cargo_postula,
+    type = type,
+    target_slug = target_slug
+  )
+}
+
+wait_for_url_match_local <- function(pattern, timeout = 20) {
+  start_time <- Sys.time()
+
+  repeat {
+    current_url <- current_url_value()
+
+    if (!is.na(current_url) && grepl(pattern, current_url, perl = TRUE)) {
+      return(current_url)
+    }
+
+    if (as.numeric(difftime(Sys.time(), start_time, units = "secs")) >= timeout) {
+      return(NA_character_)
+    }
+
+    Sys.sleep(1)
+  }
+}
+
+wait_for_parsed_rows_local <- function(parse_fn, timeout = 20, poll_interval = 1) {
+  start_time <- Sys.time()
+  last_html <- NA_character_
+  last_rows <- tibble::tibble()
+
+  repeat {
+    page_html <- current_page_source()
+
+    if (!is.na(page_html)) {
+      last_html <- page_html
+      page <- tryCatch(xml2::read_html(page_html), error = function(e) NULL)
+
+      if (!is.null(page)) {
+        parsed_rows <- tryCatch(parse_fn(page), error = function(e) tibble::tibble())
+        last_rows <- parsed_rows
+
+        if (!is.null(parsed_rows) && nrow(parsed_rows) > 0) {
+          return(list(html = page_html, rows = parsed_rows))
+        }
+      }
+    }
+
+    if (as.numeric(difftime(Sys.time(), start_time, units = "secs")) >= timeout) {
+      return(list(html = last_html, rows = last_rows))
+    }
+
+    Sys.sleep(poll_interval)
+  }
+}
+
+find_scope_card_nodes_local <- function(selector_value) {
+  tryCatch(
+    remDr$findElements(using = "css selector", value = selector_value),
+    error = function(e) list()
+  )
+}
+
+click_scope_card_by_index_local <- function(selector_value, card_index, pause_seconds = PAUSE_AFTER_CARD_CLICK) {
+  scope_nodes <- find_scope_card_nodes_local(selector_value)
+
+  if (length(scope_nodes) < card_index) {
+    stop("Scope card index does not exist on the current page.", call. = FALSE)
+  }
+
+  target_node <- scope_nodes[[card_index]]
+  scroll_node_local(target_node)
+  Sys.sleep(1)
+  target_node$clickElement()
+  Sys.sleep(pause_seconds)
+
+  invisible(TRUE)
+}
+
+extract_senate_party_scope_rows_local <- function(page, target_slug = "senadores") {
+  cards <- rvest::html_elements(
+    page,
+    "div.relative.border.border-gray-200.bg-white.p-6.rounded-lg.cursor-pointer"
+  )
+
+  if (length(cards) == 0) {
+    return(tibble::tibble(
+      card_index = integer(),
+      partido_politico = character()
+    ))
+  }
+
+  purrr::imap_dfr(cards, function(card, idx) {
+    tibble::tibble(
+      card_index = as.integer(idx),
+      partido_politico = safe_html_text(card),
+      target_slug = target_slug
+    )
+  }) %>%
+    dplyr::filter(!is.na(.data$partido_politico))
 }
 
 extract_district_options_local <- function(page) {
@@ -521,8 +698,9 @@ profile_html_ready_local <- function(page_html, current_url = NA_character_) {
   html_key <- normalize_text_local(page_html)
   loading_skeleton <- !is.na(html_key) && grepl("animate_pulse", html_key, fixed = TRUE)
   empty_name_heading <- grepl("<h1[^>]*>\\s*</h1>", page_html, perl = TRUE)
+  loading_copy <- !is.na(html_key) && grepl("cargando_hoja_de_vida", html_key, fixed = TRUE)
 
-  if (loading_skeleton || empty_name_heading) {
+  if (loading_skeleton || empty_name_heading || loading_copy) {
     return(FALSE)
   }
 
@@ -540,22 +718,36 @@ profile_html_ready_local <- function(page_html, current_url = NA_character_) {
     "domicilio",
     "sentencias_penales",
     "sentencias_no_penales",
-    "bienes_muebles_inmuebles"
+    "bienes_muebles_inmuebles",
+    "content_postulacion_comparacion",
+    "educacion_basica",
+    "estudios_tecnicos",
+    "estudios_no_universitarios",
+    "estudios_universitarios",
+    "estudios_de_posgrado",
+    "relacion_de_sentencias",
+    "ingresos_de_bienes_y_rentas"
+  )
+  detail_markers <- c(
+    "dni",
+    "sexo",
+    "lugar_de_nacimiento",
+    "lugar_de_domicilio",
+    "cargo_al_que_postula"
   )
 
   marker_match <- any(vapply(profile_markers, function(marker_value) {
     !is.na(html_key) && grepl(marker_value, html_key, fixed = TRUE)
   }, logical(1)))
+  detail_match <- any(vapply(detail_markers, function(marker_value) {
+    !is.na(html_key) && grepl(marker_value, html_key, fixed = TRUE)
+  }, logical(1)))
 
   on_profile_url <- !is.na(current_url) && grepl("/hoja-vida/[0-9]+/[0-9]+", current_url)
   still_on_results <- !is.na(html_key) && grepl("resultados_de_busqueda", html_key, fixed = TRUE)
-  transitioned_profile_page <- on_profile_url &&
-    !still_on_results &&
-    !is.na(html_key) &&
-    nchar(html_key) >= 2000 &&
-    !grepl("ver_hoja_de_vida", html_key, fixed = TRUE)
+  transitioned_profile_page <- on_profile_url && !still_on_results && marker_match && detail_match
 
-  marker_match || transitioned_profile_page
+  marker_match && detail_match || transitioned_profile_page
 }
 
 sort_results_listing_local <- function(district_row, target_value = RESULTS_SORT_VALUE, timeout = RESULTS_LOAD_TIMEOUT) {
@@ -1033,6 +1225,61 @@ resolve_profile_url_local <- function(url_value) {
   url_value
 }
 
+find_clickable_candidate_card_nodes_local <- function() {
+  selector_candidates <- c(
+    ".div-container-candidato",
+    "div.bg-white.border.border-gray-200.rounded-lg.p-4.shadow-sm.w-64.text-center.cursor-pointer",
+    "div.block.bg-white.border.border-gray-200.rounded-lg.shadow-sm",
+    "div[class*='block'][class*='bg-white'][class*='border-gray-200'][class*='rounded-lg'][class*='shadow-sm']"
+  )
+
+  for (selector_value in selector_candidates) {
+    card_nodes <- tryCatch(
+      remDr$findElements(using = "css selector", value = selector_value),
+      error = function(e) list()
+    )
+
+    if (length(card_nodes) == 0) {
+      next
+    }
+
+    if (grepl("^div\\.block", selector_value)) {
+      card_nodes <- Filter(function(card_node) {
+        card_text <- extract_node_text_local(card_node)
+        !is.na(card_text) && grepl("Ver hoja de vida", card_text, fixed = TRUE)
+      }, card_nodes)
+    }
+
+    if (length(card_nodes) > 0) {
+      return(card_nodes)
+    }
+  }
+
+  list()
+}
+
+click_candidate_card_node_local <- function(target_card) {
+  scroll_node_local(target_card)
+  Sys.sleep(PAUSE_AFTER_CARD_CLICK)
+
+  profile_buttons <- tryCatch(
+    target_card$findChildElements(
+      using = "xpath",
+      value = ".//button[contains(normalize-space(.), 'Ver hoja de vida')] | .//a[contains(normalize-space(.), 'Ver hoja de vida')]"
+    ),
+    error = function(e) list()
+  )
+
+  if (length(profile_buttons) > 0) {
+    profile_buttons[[1]]$clickElement()
+  } else {
+    target_card$clickElement()
+  }
+
+  Sys.sleep(PAUSE_AFTER_CARD_CLICK)
+  invisible(TRUE)
+}
+
 open_candidate_profile_local <- function(district_row, card_row) {
   hinted_url <- coalesce_chr(
     resolve_profile_url_local(coalesce_chr(card_row$url_hoja_vida)),
@@ -1054,99 +1301,14 @@ open_candidate_profile_local <- function(district_row, card_row) {
     return(invisible(hinted_url))
   }
 
-  listing_snapshot <- current_results_snapshot_local(district_row, timeout = 2)
+  matched_card_index <- suppressWarnings(as.integer(card_row$card_index[[1]]))
+  card_nodes <- find_clickable_candidate_card_nodes_local()
 
-  if (is.null(listing_snapshot) || nrow(listing_snapshot$cards) == 0) {
-    listing_snapshot <- open_results_listing_for_district_local(district_row)
-  }
-  matched_card_index <- NA_integer_
-
-  if (nrow(listing_snapshot$cards) > 0) {
-    listing_name_keys <- vapply(listing_snapshot$cards$nombre, normalize_text_local, character(1))
-    listing_party_keys <- vapply(listing_snapshot$cards$partido_politico, normalize_text_local, character(1))
-    target_name_key <- normalize_text_local(card_row$nombre[[1]])
-    target_party_key <- normalize_text_local(card_row$partido_politico[[1]])
-
-    matching_rows <- which(
-      listing_name_keys == target_name_key &
-        (
-          is.na(coalesce_chr(card_row$dni_listado)) |
-            listing_snapshot$cards$dni_listado == coalesce_chr(card_row$dni_listado)
-        )
-    )
-
-    if (length(matching_rows) == 0) {
-      matching_rows <- which(
-        listing_name_keys == target_name_key &
-          listing_party_keys == target_party_key
-      )
-    }
-
-    if (length(matching_rows) > 0) {
-      matched_card_index <- matching_rows[[1]]
-    }
+  if (is.na(matched_card_index) || length(card_nodes) < matched_card_index) {
+    stop("Candidate card index does not exist on the current page.", call. = FALSE)
   }
 
-  if (is.na(matched_card_index)) {
-    matched_card_index <- suppressWarnings(as.integer(card_row$card_index[[1]]))
-  }
-
-  if (is.na(matched_card_index) || nrow(listing_snapshot$cards) < matched_card_index) {
-    stop("Candidate card index does not exist in the rendered resultados listing.", call. = FALSE)
-  }
-
-  card_nodes <- tryCatch(
-    remDr$findElements(using = "css selector", value = ".div-container-candidato"),
-    error = function(e) list()
-  )
-
-  if (length(card_nodes) < matched_card_index) {
-    card_nodes <- tryCatch(
-      remDr$findElements(
-        using = "css selector",
-        value = "div.block.bg-white.border.border-gray-200.rounded-lg.shadow-sm"
-      ),
-      error = function(e) list()
-    )
-
-    if (length(card_nodes) > 0) {
-      card_nodes <- Filter(function(node) {
-        node_text <- extract_node_text_local(node)
-        nzchar(node_text) && grepl("Ver hoja de vida", node_text, fixed = TRUE)
-      }, card_nodes)
-    }
-  }
-
-  if (length(card_nodes) < matched_card_index) {
-    card_nodes <- tryCatch(
-      remDr$findElements(using = "xpath", value = "//a[contains(@href, '/hoja-vida/')]"),
-      error = function(e) list()
-    )
-  }
-
-  if (length(card_nodes) < matched_card_index) {
-    stop("Candidate card nodes are not available in the rendered resultados listing.", call. = FALSE)
-  }
-
-  target_card <- card_nodes[[matched_card_index]]
-  scroll_node_local(target_card)
-  Sys.sleep(PAUSE_AFTER_CARD_CLICK)
-
-  profile_buttons <- tryCatch(
-    target_card$findChildElements(
-      using = "xpath",
-      value = ".//button[contains(normalize-space(.), 'Ver hoja de vida')] | .//a[contains(normalize-space(.), 'Ver hoja de vida')]"
-    ),
-    error = function(e) list()
-  )
-
-  if (length(profile_buttons) > 0) {
-    profile_buttons[[1]]$clickElement()
-  } else {
-    target_card$clickElement()
-  }
-
-  Sys.sleep(PAUSE_AFTER_CARD_CLICK)
+  click_candidate_card_node_local(card_nodes[[matched_card_index]])
 
   if (!wait_for_profile_page_local(timeout = PROFILE_LOAD_TIMEOUT)) {
     stop("Profile page did not load after clicking the candidate card.", call. = FALSE)
@@ -1161,13 +1323,9 @@ wait_for_profile_page_local <- function(timeout = PROFILE_LOAD_TIMEOUT) {
   repeat {
     current_url <- tryCatch(remDr$getCurrentUrl()[[1]], error = function(e) NA_character_)
     page_html <- current_page_source()
-    profile_nodes <- tryCatch(
-      remDr$findElements(using = "css selector", value = "main section, main h1"),
-      error = function(e) list()
-    )
     profile_text_match <- profile_html_ready_local(page_html, current_url = current_url)
 
-    if (length(profile_nodes) > 0 || isTRUE(profile_text_match)) {
+    if (isTRUE(profile_text_match)) {
       return(TRUE)
     }
 
@@ -1179,6 +1337,276 @@ wait_for_profile_page_local <- function(timeout = PROFILE_LOAD_TIMEOUT) {
   }
 }
 
+merge_saved_scope_cards_local <- function(cards, scope_row, snapshot_suffix) {
+  cards <- tibble::as_tibble(cards)
+
+  if (nrow(cards) == 0) {
+    return(cards)
+  }
+
+  snapshot_csv_path <- file.path(
+    "data",
+    "raw",
+    "listados",
+    paste0(listing_snapshot_prefix(scope_row, suffix = snapshot_suffix), "_candidatos.csv")
+  )
+
+  saved_cards <- read_csv_chr(snapshot_csv_path)
+
+  if (is.null(saved_cards) || nrow(saved_cards) == 0 || !"card_index" %in% names(saved_cards)) {
+    return(cards)
+  }
+
+  merge_cols <- intersect(
+    names(cards),
+    c(
+      "dni_listado",
+      "partido_politico",
+      "cargo_postula",
+      "type",
+      "url_imagen",
+      "url_logo_partido",
+      "url_hoja_vida"
+    )
+  )
+
+  if (length(merge_cols) == 0) {
+    return(cards)
+  }
+
+  cards <- cards %>%
+    dplyr::mutate(card_index = as.character(.data$card_index))
+  saved_cards <- saved_cards %>%
+    dplyr::mutate(card_index = as.character(.data$card_index))
+
+  saved_lookup <- saved_cards %>%
+    dplyr::select("card_index", dplyr::all_of(merge_cols)) %>%
+    dplyr::distinct(.data$card_index, .keep_all = TRUE)
+
+  merged_cards <- cards %>%
+    dplyr::left_join(saved_lookup, by = "card_index", suffix = c("", "_saved"))
+
+  for (col_name in merge_cols) {
+    saved_col <- paste0(col_name, "_saved")
+    merged_cards[[col_name]] <- purrr::pmap_chr(
+      list(merged_cards[[col_name]], merged_cards[[saved_col]]),
+      function(current_value, saved_value) {
+        coalesce_chr(current_value, saved_value)
+      }
+    )
+  }
+
+  merged_cards %>%
+    dplyr::select(dplyr::all_of(names(cards)))
+}
+
+update_scope_cards_with_profile_local <- function(cards, card_row, parsed_candidate, current_url, current_ids) {
+  cards <- tibble::as_tibble(cards)
+
+  if (nrow(cards) == 0 || !"card_index" %in% names(cards)) {
+    return(cards)
+  }
+
+  target_index <- suppressWarnings(as.integer(card_row$card_index[[1]]))
+
+  if (is.na(target_index)) {
+    return(cards)
+  }
+
+  match_idx <- which(suppressWarnings(as.integer(cards$card_index)) == target_index)
+
+  if (length(match_idx) == 0) {
+    return(cards)
+  }
+
+  row_idx <- match_idx[[1]]
+  cards$nombre[[row_idx]] <- coalesce_chr(parsed_candidate$main$nombre[[1]], cards$nombre[[row_idx]])
+  cards$dni_listado[[row_idx]] <- coalesce_chr(current_ids$dni, parsed_candidate$main$dni[[1]], cards$dni_listado[[row_idx]])
+  cards$partido_politico[[row_idx]] <- coalesce_chr(parsed_candidate$main$partido_politico[[1]], cards$partido_politico[[row_idx]])
+  cards$cargo_postula[[row_idx]] <- coalesce_chr(parsed_candidate$main$cargo_postula[[1]], cards$cargo_postula[[row_idx]])
+  cards$type[[row_idx]] <- coalesce_chr(parsed_candidate$main$type[[1]], cards$type[[row_idx]])
+  cards$url_imagen[[row_idx]] <- coalesce_chr(parsed_candidate$main$url_imagen[[1]], cards$url_imagen[[row_idx]])
+  cards$url_logo_partido[[row_idx]] <- coalesce_chr(parsed_candidate$main$url_logo_partido[[1]], cards$url_logo_partido[[row_idx]])
+  cards$url_hoja_vida[[row_idx]] <- coalesce_chr(current_url, cards$url_hoja_vida[[row_idx]])
+
+  cards
+}
+
+process_scope_candidates_local <- function(scope_label,
+                                           scope_row,
+                                           scope_url,
+                                           scope_html,
+                                           cards,
+                                           snapshot_suffix,
+                                           restore_scope_fn = NULL,
+                                           completed_ids) {
+  working_cards <- merge_saved_scope_cards_local(cards, scope_row, snapshot_suffix)
+
+  save_listing_snapshot(
+    scope_row,
+    scope_html,
+    working_cards,
+    suffix = snapshot_suffix
+  )
+
+  cards_to_process <- working_cards
+
+  if (!is.na(MAX_CANDIDATES_PER_DISTRICT)) {
+    cards_to_process <- cards_to_process %>% dplyr::slice_head(n = MAX_CANDIDATES_PER_DISTRICT)
+  }
+
+  log_message(paste("  Candidate cards detected:", nrow(cards_to_process)))
+
+  if (nrow(cards_to_process) == 0) {
+    return(list(cards = working_cards, completed_ids = completed_ids))
+  }
+
+  candidatos_path <- file.path("output", "candidatos.csv")
+
+  for (card_idx in seq_len(nrow(cards_to_process))) {
+    card_row <- cards_to_process[card_idx, , drop = FALSE]
+    skip_candidate <- FALSE
+    did_open_profile <- FALSE
+    hinted_url <- NA_character_
+
+    log_message(
+      paste0(
+        "  Candidate ", card_idx, "/", nrow(cards_to_process), ": ",
+        coalesce_chr(card_row$nombre, paste("card", card_idx))
+      )
+    )
+
+    tryCatch({
+      if (is.function(restore_scope_fn) && is.na(coalesce_chr(card_row$url_hoja_vida))) {
+        restore_scope_fn()
+      }
+
+      hinted_url <- coalesce_chr(
+        resolve_profile_url_local(coalesce_chr(card_row$url_hoja_vida)),
+        build_profile_url_from_listing(
+          coalesce_chr(card_row$url_logo_partido),
+          coalesce_chr(card_row$dni_listado),
+          base = current_url_value()
+        )
+      )
+      hinted_ids <- derive_candidate_ids(
+        hinted_url,
+        type = row_value_or_na(card_row, "type"),
+        target_slug = row_value_or_na(scope_row, "target_slug")
+      )
+
+      if (!is.na(hinted_ids$id_candidato) && hinted_ids$id_candidato %in% completed_ids) {
+        log_message(paste("    Skipping completed candidate:", hinted_ids$id_candidato))
+        skip_candidate <- TRUE
+      }
+
+      if (!skip_candidate) {
+        open_candidate_profile_local(scope_row, card_row)
+        did_open_profile <- TRUE
+      }
+
+      if (!skip_candidate) {
+        current_url <- resolve_profile_url_local(current_url_value())
+        current_ids <- derive_candidate_ids(
+          current_url,
+          type = row_value_or_na(card_row, "type"),
+          target_slug = row_value_or_na(scope_row, "target_slug")
+        )
+
+        if (is.na(current_ids$id_candidato)) {
+          stop("Unable to derive id_candidato from the current profile URL.")
+        }
+
+        if (current_ids$id_candidato %in% completed_ids) {
+          log_message(paste("    Already persisted:", current_ids$id_candidato))
+          skip_candidate <- TRUE
+        }
+      }
+
+      if (!skip_candidate) {
+        profile_html <- current_page_source()
+
+        if (is.na(profile_html) || !profile_html_ready_local(profile_html, current_url = current_url)) {
+          stop("Rendered profile HTML does not look like a loaded hoja de vida page.")
+        }
+
+        save_profile_snapshot(current_ids$id_candidato, profile_html)
+
+        profile_page <- xml2::read_html(profile_html)
+        parsed_candidate <- parse_candidate_profile(profile_page, card_row, scope_row, current_url)
+
+        image_dest <- build_image_path(parsed_candidate$main[1, ])
+        image_path <- download_candidate_image(parsed_candidate$main$url_imagen[[1]], image_dest)
+        parsed_candidate$main$ruta_imagen <- image_path
+
+        replace_rows_by_candidate(
+          parsed_candidate$main,
+          candidatos_path,
+          parsed_candidate$ids$id_candidato,
+          default_cols = candidate_output_columns
+        )
+
+        for (section_name in names(section_file_map)) {
+          section_df <- parsed_candidate$sections[[section_name]]
+          section_path <- section_file_map[[section_name]]
+          section_defaults <- section_default_columns[[section_name]]
+
+          replace_rows_by_candidate(
+            section_df,
+            section_path,
+            parsed_candidate$ids$id_candidato,
+            default_cols = section_defaults
+          )
+        }
+
+        mark_candidate_completed(parsed_candidate$main)
+        completed_ids <- unique(c(completed_ids, parsed_candidate$ids$id_candidato))
+        working_cards <- update_scope_cards_with_profile_local(
+          working_cards,
+          card_row,
+          parsed_candidate,
+          current_url,
+          current_ids
+        )
+
+        save_listing_snapshot(
+          scope_row,
+          scope_html,
+          working_cards,
+          suffix = snapshot_suffix
+        )
+
+        log_message(paste("    Saved:", parsed_candidate$ids$id_candidato))
+      }
+    }, error = function(e) {
+      append_error_row(tibble::tibble(
+        fecha = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+        distrito_electoral = scope_row$distrito_electoral,
+        codigo_distrito_electoral = scope_row$codigo_distrito_electoral,
+        card_index = as.character(card_row$card_index[[1]]),
+        url_hoja_vida = hinted_url,
+        id_candidato = coalesce_chr(
+          derive_candidate_ids(
+            hinted_url,
+            type = row_value_or_na(card_row, "type"),
+            target_slug = row_value_or_na(scope_row, "target_slug")
+          )$id_candidato
+        ),
+        error = paste(scope_label, ":", e$message)
+      ))
+
+      log_message(paste("    Error:", e$message))
+      Sys.sleep(1)
+    })
+
+    if (isTRUE(did_open_profile)) {
+      pause_between_candidates_local(card_idx, nrow(cards_to_process))
+    }
+  }
+
+  list(cards = working_cards, completed_ids = completed_ids)
+}
+
 # ======================================
 # ==========  START RSELENIUM ===========
 # ======================================
@@ -1187,272 +1615,432 @@ browser_mode_label <- if (isTRUE(HEADLESS)) "headless" else "visible"
 
 log_message(paste("Starting", browser_mode_label, "Peru 2026 election candidate scrapper."))
 log_message(paste("Starting a single", browser_mode_label, "Firefox RSelenium session."))
-
-# Firefox / geckodriver startup can fail on a cold start, so we retry a few times
-# before giving up on the whole run.
-rD <- NULL
-
-for (selenium_attempt in seq_len(3)) {
-  firefox_args <- c("--width=1600", "--height=1200")
-
-  if (isTRUE(HEADLESS)) {
-    firefox_args <- c(firefox_args, "-headless")
-  }
-
-  rD <- tryCatch(
-    rsDriver(
-      port = sample(7600:7699, 1),
-      browser = c("firefox"),
-      chromever = NULL,
-      check = FALSE,
-      verbose = FALSE,
-      extraCapabilities = list(
-        `moz:firefoxOptions` = list(args = firefox_args)
-      )
-    ),
-    error = function(e) {
-      if (selenium_attempt < 3) {
-        log_message(
-          paste(
-            "Firefox startup attempt",
-            selenium_attempt,
-            "failed. Retrying."
-          )
-        )
-        Sys.sleep(3)
-        return(NULL)
-      }
-
-      stop(e)
-    }
-  )
-
-  if (!is.null(rD)) {
-    break
-  }
-}
+rD <- start_firefox_selenium(
+  headless = HEADLESS,
+  log_fn = log_message
+)
 
 remDr <- rD$client
-remDr$setWindowSize(1600, 1200)
 
-on.exit({
-  try(remDr$close(), silent = TRUE)
-  try(rD$server$stop(), silent = TRUE)
-}, add = TRUE)
-
-
-# ======================================
-# ==========  LOAD DISTRICTS ============
-# ======================================
-
-log_message("Opening diputados listing page.")
-open_listing_page_local()
-
-listing_html <- current_page_source()
-
-if (is.na(listing_html)) {
-  stop("Unable to read the rendered diputados page.", call. = FALSE)
-}
-
-listing_page <- xml2::read_html(listing_html)
-districts <- extract_district_options_local(listing_page)
-
-if (nrow(districts) == 0) {
-  stop("No district options were found in the diputados selector.", call. = FALSE)
-}
-
-if (length(DISTRICT_FILTER) > 0) {
-  districts <- districts %>%
-    dplyr::filter(
-      .data$codigo_distrito_electoral %in% DISTRICT_FILTER |
-        .data$distrito_electoral %in% DISTRICT_FILTER
-    )
-}
-
-if (!is.na(MAX_DISTRICTS)) {
-  districts <- districts %>% dplyr::slice_head(n = MAX_DISTRICTS)
-}
-
-log_message(paste("Districts queued:", nrow(districts)))
+on.exit(close_firefox_selenium(rD), add = TRUE)
 
 
 # ======================================
 # ==========  SCRAPING LOOP =============
 # ======================================
 
-candidatos_path <- file.path("output", "candidatos.csv")
+selected_targets <- TARGET_CONFIGS[TARGET_FILTER]
 completed_ids <- completed_candidate_ids()
 
-# Keep the run resumable by persisting each candidate independently.
+log_message(paste("Targets queued:", paste(names(selected_targets), collapse = ", ")))
 log_message(paste("Candidates already marked complete:", length(completed_ids)))
 
-for (district_idx in seq_len(nrow(districts))) {
-  district_row <- districts[district_idx, , drop = FALSE]
+for (target_id in names(selected_targets)) {
+  target <- selected_targets[[target_id]]
+  log_message(paste("Starting target:", target$id))
 
-  log_message(
-    paste0(
-      "District ", district_idx, "/", nrow(districts), ": ",
-      district_row$distrito_electoral, " [", district_row$codigo_distrito_electoral, "]"
-    )
-  )
+  if (identical(target$id, "diputados")) {
+    BASE_URL <- target$base_url
+    EMBED_URL <- target$embed_url
 
-  tryCatch({
-    candidate_snapshot <- open_results_listing_for_district_local(district_row)
+    log_message("Opening diputados listing page.")
+    open_listing_page_local()
 
-    save_listing_snapshot(
-      district_row,
-      candidate_snapshot$html,
-      candidate_snapshot$cards,
-      suffix = "resultados"
-    )
+    listing_html <- current_page_source()
 
-    cards <- candidate_snapshot$cards
-
-    if (!is.na(MAX_CANDIDATES_PER_DISTRICT)) {
-      cards <- cards %>% dplyr::slice_head(n = MAX_CANDIDATES_PER_DISTRICT)
+    if (is.na(listing_html)) {
+      stop("Unable to read the rendered diputados page.", call. = FALSE)
     }
 
-    log_message(paste("  Candidate cards detected:", nrow(cards)))
+    listing_page <- xml2::read_html(listing_html)
+    districts <- extract_district_options_local(listing_page) %>%
+      dplyr::mutate(
+        cargo_postula = "DIPUTADO",
+        type = "Diputado",
+        target_slug = target$id
+      )
 
-    for (card_idx in seq_len(nrow(cards))) {
-      # Process one candidate at a time so partial reruns can skip work that has
-      # already been safely persisted in previous attempts.
-      card_row <- cards[card_idx, , drop = FALSE]
-      skip_candidate <- FALSE
+    if (nrow(districts) == 0) {
+      stop("No district options were found in the diputados selector.", call. = FALSE)
+    }
+
+    if (length(DISTRICT_FILTER) > 0) {
+      districts <- districts %>%
+        dplyr::filter(
+          .data$codigo_distrito_electoral %in% DISTRICT_FILTER |
+            .data$distrito_electoral %in% DISTRICT_FILTER
+        )
+    }
+
+    if (!is.na(MAX_DISTRICTS)) {
+      districts <- districts %>% dplyr::slice_head(n = MAX_DISTRICTS)
+    }
+
+    log_message(paste("Districts queued:", nrow(districts)))
+
+    for (district_idx in seq_len(nrow(districts))) {
+      district_row <- districts[district_idx, , drop = FALSE]
 
       log_message(
         paste0(
-          "  Candidate ", card_idx, "/", nrow(cards), ": ",
-          coalesce_chr(card_row$nombre, paste("card", card_idx))
+          "District ", district_idx, "/", nrow(districts), ": ",
+          district_row$distrito_electoral, " [", district_row$codigo_distrito_electoral, "]"
         )
       )
 
       tryCatch({
-        hinted_url <- coalesce_chr(
-          resolve_profile_url_local(coalesce_chr(card_row$url_hoja_vida)),
-          build_profile_url_from_listing(
-            coalesce_chr(card_row$url_logo_partido),
-            coalesce_chr(card_row$dni_listado),
-            base = current_url_value()
+        candidate_snapshot <- open_results_listing_for_district_local(district_row)
+        cards <- tibble::as_tibble(candidate_snapshot$cards)
+
+        if (!"cargo_postula" %in% names(cards)) {
+          cards$cargo_postula <- NA_character_
+        }
+
+        if (!"type" %in% names(cards)) {
+          cards$type <- NA_character_
+        }
+
+        cards <- cards %>%
+          dplyr::mutate(
+            cargo_postula = purrr::map_chr(.data$cargo_postula, ~ coalesce_chr(.x, "DIPUTADO")),
+            type = purrr::map_chr(.data$type, ~ coalesce_chr(.x, "Diputado"))
           )
+
+        scope_result <- process_scope_candidates_local(
+          scope_label = "Diputados",
+          scope_row = district_row,
+          scope_url = current_url_value(),
+          scope_html = candidate_snapshot$html,
+          cards = cards,
+          snapshot_suffix = "resultados",
+          restore_scope_fn = NULL,
+          completed_ids = completed_ids
         )
-        hinted_ids <- derive_candidate_ids(hinted_url)
 
-        if (!is.na(hinted_ids$id_candidato) && hinted_ids$id_candidato %in% completed_ids) {
-          log_message(paste("    Skipping completed candidate:", hinted_ids$id_candidato))
-          skip_candidate <- TRUE
-        }
-
-        if (!skip_candidate) {
-          open_candidate_profile_local(district_row, card_row)
-        }
-
-        if (!skip_candidate) {
-          current_url <- resolve_profile_url_local(current_url_value())
-          current_ids <- derive_candidate_ids(current_url)
-
-          if (is.na(current_ids$id_candidato)) {
-            stop("Unable to derive id_candidato from the current profile URL.")
-          }
-
-          if (current_ids$id_candidato %in% completed_ids) {
-            log_message(paste("    Already persisted:", current_ids$id_candidato))
-            skip_candidate <- TRUE
-          }
-        }
-
-        if (!skip_candidate) {
-          profile_html <- current_page_source()
-
-          if (is.na(profile_html) || !profile_html_ready_local(profile_html, current_url = current_url)) {
-            stop("Rendered profile HTML does not look like a loaded hoja de vida page.")
-          }
-
-          save_profile_snapshot(current_ids$id_candidato, profile_html)
-
-          profile_page <- xml2::read_html(profile_html)
-          parsed_candidate <- parse_candidate_profile(profile_page, card_row, district_row, current_url)
-
-          image_dest <- build_image_path(parsed_candidate$main[1, ])
-          image_path <- download_candidate_image(parsed_candidate$main$url_imagen[[1]], image_dest)
-          parsed_candidate$main$ruta_imagen <- image_path
-
-          replace_rows_by_candidate(
-            parsed_candidate$main,
-            candidatos_path,
-            parsed_candidate$ids$id_candidato,
-            default_cols = candidate_output_columns
-          )
-
-          for (section_name in names(section_file_map)) {
-            section_df <- parsed_candidate$sections[[section_name]]
-            section_path <- section_file_map[[section_name]]
-            section_defaults <- section_default_columns[[section_name]]
-
-            replace_rows_by_candidate(
-              section_df,
-              section_path,
-              parsed_candidate$ids$id_candidato,
-              default_cols = section_defaults
-            )
-          }
-
-          mark_candidate_completed(parsed_candidate$main)
-          completed_ids <- unique(c(completed_ids, parsed_candidate$ids$id_candidato))
-
-          log_message(paste("    Saved:", parsed_candidate$ids$id_candidato))
-        }
+        completed_ids <- scope_result$completed_ids
       }, error = function(e) {
         append_error_row(tibble::tibble(
           fecha = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
           distrito_electoral = district_row$distrito_electoral,
           codigo_distrito_electoral = district_row$codigo_distrito_electoral,
-          card_index = as.character(card_row$card_index[[1]]),
-          url_hoja_vida = hinted_url,
-          id_candidato = coalesce_chr(derive_candidate_ids(hinted_url)$id_candidato),
-          error = e$message
+          card_index = NA_character_,
+          url_hoja_vida = NA_character_,
+          id_candidato = NA_character_,
+          error = paste("Diputados:", e$message)
         ))
 
-        log_message(paste("    Error:", e$message))
+        log_message(paste("  Error:", e$message))
         Sys.sleep(1)
       })
-    }
-  }, error = function(e) {
-    append_error_row(tibble::tibble(
-      fecha = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-      distrito_electoral = district_row$distrito_electoral,
-      codigo_distrito_electoral = district_row$codigo_distrito_electoral,
-      card_index = NA_character_,
-      url_hoja_vida = NA_character_,
-      id_candidato = NA_character_,
-      error = e$message
-    ))
 
-    log_message(paste("  Error:", e$message))
-    Sys.sleep(1)
-  })
-
-  checkpoint_info <- tryCatch(
-    save_district_checkpoint(district_row, district_idx = district_idx),
-    error = function(e) e
-  )
-
-  if (inherits(checkpoint_info, "error")) {
-    log_message(paste("  Checkpoint error:", checkpoint_info$message))
-  } else {
-    log_message(
-      paste0(
-        "  Checkpoint saved: ",
-        checkpoint_info$dir,
-        " (",
-        length(checkpoint_info$files),
-        " files)"
+      checkpoint_info <- tryCatch(
+        save_district_checkpoint(district_row, district_idx = district_idx),
+        error = function(e) e
       )
-    )
+
+      if (inherits(checkpoint_info, "error")) {
+        log_message(paste("  Checkpoint error:", checkpoint_info$message))
+      } else {
+        log_message(
+          paste0(
+            "  Checkpoint saved: ",
+            checkpoint_info$dir,
+            " (",
+            length(checkpoint_info$files),
+            " files)"
+          )
+        )
+      }
+
+      log_message(paste("Finished district:", district_row$distrito_electoral))
+      Sys.sleep(PAUSE_BETWEEN_DISTRICTS)
+    }
+
+    next
   }
 
-  log_message(paste("Finished district:", district_row$distrito_electoral))
-  Sys.sleep(PAUSE_BETWEEN_DISTRICTS)
+  if (identical(target$id, "presidente-vicepresidentes")) {
+    scope_row <- peru_scope_row_local(target$id)
+    remDr$navigate(target$base_url)
+    Sys.sleep(PAUSE_AFTER_PAGE_LOAD)
+
+    formula_scope_snapshot <- wait_for_parsed_rows_local(
+      function(page) extract_listing_cards(page, scope_row),
+      timeout = RESULTS_LOAD_TIMEOUT
+    )
+
+    formula_scope_rows <- formula_scope_snapshot$rows
+
+    if (nrow(formula_scope_rows) == 0) {
+      stop("No presidential formula cards were found on the landing page.", call. = FALSE)
+    }
+
+    if (!is.na(MAX_DISTRICTS)) {
+      formula_scope_rows <- formula_scope_rows %>% dplyr::slice_head(n = MAX_DISTRICTS)
+    }
+
+    log_message(paste("Formulas queued:", nrow(formula_scope_rows)))
+
+    for (formula_idx in seq_len(nrow(formula_scope_rows))) {
+      formula_row <- formula_scope_rows[formula_idx, , drop = FALSE]
+
+      log_message(
+        paste0(
+          "Formula ", formula_idx, "/", nrow(formula_scope_rows), ": ",
+          coalesce_chr(formula_row$partido_politico, paste("formula", formula_idx))
+        )
+      )
+
+      tryCatch({
+        remDr$navigate(target$base_url)
+        Sys.sleep(PAUSE_AFTER_PAGE_LOAD)
+
+        refreshed_scope <- wait_for_parsed_rows_local(
+          function(page) extract_listing_cards(page, scope_row),
+          timeout = RESULTS_LOAD_TIMEOUT
+        )
+
+        if (nrow(refreshed_scope$rows) == 0) {
+          stop("Presidential landing cards did not reload before clicking the formula card.", call. = FALSE)
+        }
+
+        click_scope_card_by_index_local(".div-container-candidato", as.integer(formula_row$card_index[[1]]))
+
+        formula_url <- wait_for_url_match_local("/formula-presidencial/[0-9]+$", timeout = 20)
+
+        if (is.na(formula_url)) {
+          stop("The formula-presidencial page did not open after clicking the party card.", call. = FALSE)
+        }
+
+        formula_snapshot <- wait_for_parsed_rows_local(
+          function(page) extract_formula_candidate_cards(page, scope_row),
+          timeout = RESULTS_LOAD_TIMEOUT
+        )
+
+        formula_cards <- formula_snapshot$rows %>%
+          dplyr::mutate(
+            partido_politico = dplyr::coalesce(.data$partido_politico, formula_row$partido_politico)
+          )
+
+        if (nrow(formula_cards) == 0) {
+          stop("No formula members were found on the formula-presidencial page.", call. = FALSE)
+        }
+
+        snapshot_suffix <- paste("formula", slugify_path(coalesce_chr(formula_row$partido_politico, formula_url)), sep = "_")
+
+        restore_scope_fn <- function() {
+          remDr$navigate(formula_url)
+          Sys.sleep(PAUSE_AFTER_PAGE_LOAD)
+
+          restored_scope <- wait_for_parsed_rows_local(
+            function(page) extract_formula_candidate_cards(page, scope_row),
+            timeout = RESULTS_LOAD_TIMEOUT
+          )
+
+          if (nrow(restored_scope$rows) == 0) {
+            stop("Formula member cards did not reload after returning to the formula page.", call. = FALSE)
+          }
+
+          invisible(restored_scope)
+        }
+
+        scope_result <- process_scope_candidates_local(
+          scope_label = "Formula presidencial",
+          scope_row = scope_row,
+          scope_url = formula_url,
+          scope_html = formula_snapshot$html,
+          cards = formula_cards,
+          snapshot_suffix = snapshot_suffix,
+          restore_scope_fn = restore_scope_fn,
+          completed_ids = completed_ids
+        )
+
+        completed_ids <- scope_result$completed_ids
+      }, error = function(e) {
+        append_error_row(tibble::tibble(
+          fecha = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+          distrito_electoral = scope_row$distrito_electoral,
+          codigo_distrito_electoral = scope_row$codigo_distrito_electoral,
+          card_index = as.character(formula_row$card_index[[1]]),
+          url_hoja_vida = current_url_value(),
+          id_candidato = NA_character_,
+          error = paste("Formula presidencial:", e$message)
+        ))
+
+        log_message(paste("  Error:", e$message))
+        Sys.sleep(1)
+      })
+
+      checkpoint_info <- tryCatch(
+        save_district_checkpoint(scope_row, district_idx = formula_idx),
+        error = function(e) e
+      )
+
+      if (inherits(checkpoint_info, "error")) {
+        log_message(paste("  Checkpoint error:", checkpoint_info$message))
+      } else {
+        log_message(
+          paste0(
+            "  Checkpoint saved: ",
+            checkpoint_info$dir,
+            " (",
+            length(checkpoint_info$files),
+            " files)"
+          )
+        )
+      }
+
+      log_message(paste("Finished formula:", coalesce_chr(formula_row$partido_politico, paste("formula", formula_idx))))
+      Sys.sleep(PAUSE_BETWEEN_DISTRICTS)
+    }
+
+    next
+  }
+
+  if (identical(target$id, "senadores")) {
+    scope_row <- peru_scope_row_local(
+      target$id,
+      cargo_postula = "SENADOR",
+      type = "Senador"
+    )
+    remDr$navigate(target$base_url)
+    Sys.sleep(PAUSE_AFTER_PAGE_LOAD)
+
+    senate_scope_snapshot <- wait_for_parsed_rows_local(
+      function(page) extract_senate_party_scope_rows_local(page, target_slug = target$id),
+      timeout = RESULTS_LOAD_TIMEOUT
+    )
+
+    senate_scope_rows <- senate_scope_snapshot$rows
+
+    if (nrow(senate_scope_rows) == 0) {
+      stop("No senate party cards were found on the senadores landing page.", call. = FALSE)
+    }
+
+    if (!is.na(MAX_DISTRICTS)) {
+      senate_scope_rows <- senate_scope_rows %>% dplyr::slice_head(n = MAX_DISTRICTS)
+    }
+
+    log_message(paste("Senate parties queued:", nrow(senate_scope_rows)))
+
+    for (party_idx in seq_len(nrow(senate_scope_rows))) {
+      party_row <- senate_scope_rows[party_idx, , drop = FALSE]
+
+      log_message(
+        paste0(
+          "Party ", party_idx, "/", nrow(senate_scope_rows), ": ",
+          coalesce_chr(party_row$partido_politico, paste("party", party_idx))
+        )
+      )
+
+      tryCatch({
+        remDr$navigate(target$base_url)
+        Sys.sleep(PAUSE_AFTER_PAGE_LOAD)
+
+        refreshed_scope <- wait_for_parsed_rows_local(
+          function(page) extract_senate_party_scope_rows_local(page, target_slug = target$id),
+          timeout = RESULTS_LOAD_TIMEOUT
+        )
+
+        if (nrow(refreshed_scope$rows) == 0) {
+          stop("Senate party cards did not reload before clicking the party card.", call. = FALSE)
+        }
+
+        click_scope_card_by_index_local(
+          "div.relative.border.border-gray-200.bg-white.p-6.rounded-lg.cursor-pointer",
+          as.integer(party_row$card_index[[1]])
+        )
+
+        party_url <- wait_for_url_match_local("senadores\\?partido=", timeout = 20)
+
+        if (is.na(party_url)) {
+          stop("The senate party page did not open after clicking the party card.", call. = FALSE)
+        }
+
+        senate_candidate_snapshot <- wait_for_parsed_rows_local(
+          function(page) extract_listing_cards(page, scope_row),
+          timeout = RESULTS_LOAD_TIMEOUT
+        )
+
+        senate_cards <- senate_candidate_snapshot$rows %>%
+          dplyr::mutate(
+            partido_politico = dplyr::coalesce(.data$partido_politico, party_row$partido_politico),
+            cargo_postula = dplyr::coalesce(.data$cargo_postula, "SENADOR"),
+            type = dplyr::coalesce(.data$type, "Senador")
+          )
+
+        if (nrow(senate_cards) == 0) {
+          stop("No senate candidate cards were found on the party page.", call. = FALSE)
+        }
+
+        snapshot_suffix <- paste("partido", slugify_path(coalesce_chr(party_row$partido_politico, party_url)), sep = "_")
+
+        restore_scope_fn <- function() {
+          remDr$navigate(party_url)
+          Sys.sleep(PAUSE_AFTER_PAGE_LOAD)
+
+          restored_scope <- wait_for_parsed_rows_local(
+            function(page) extract_listing_cards(page, scope_row),
+            timeout = RESULTS_LOAD_TIMEOUT
+          )
+
+          if (nrow(restored_scope$rows) == 0) {
+            stop("Senate candidate cards did not reload after returning to the party page.", call. = FALSE)
+          }
+
+          invisible(restored_scope)
+        }
+
+        scope_result <- process_scope_candidates_local(
+          scope_label = "Senadores",
+          scope_row = scope_row,
+          scope_url = party_url,
+          scope_html = senate_candidate_snapshot$html,
+          cards = senate_cards,
+          snapshot_suffix = snapshot_suffix,
+          restore_scope_fn = restore_scope_fn,
+          completed_ids = completed_ids
+        )
+
+        completed_ids <- scope_result$completed_ids
+      }, error = function(e) {
+        append_error_row(tibble::tibble(
+          fecha = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+          distrito_electoral = scope_row$distrito_electoral,
+          codigo_distrito_electoral = scope_row$codigo_distrito_electoral,
+          card_index = as.character(party_row$card_index[[1]]),
+          url_hoja_vida = current_url_value(),
+          id_candidato = NA_character_,
+          error = paste("Senadores:", e$message)
+        ))
+
+        log_message(paste("  Error:", e$message))
+        Sys.sleep(1)
+      })
+
+      checkpoint_info <- tryCatch(
+        save_district_checkpoint(scope_row, district_idx = party_idx),
+        error = function(e) e
+      )
+
+      if (inherits(checkpoint_info, "error")) {
+        log_message(paste("  Checkpoint error:", checkpoint_info$message))
+      } else {
+        log_message(
+          paste0(
+            "  Checkpoint saved: ",
+            checkpoint_info$dir,
+            " (",
+            length(checkpoint_info$files),
+            " files)"
+          )
+        )
+      }
+
+      log_message(paste("Finished party:", coalesce_chr(party_row$partido_politico, paste("party", party_idx))))
+      Sys.sleep(PAUSE_BETWEEN_DISTRICTS)
+    }
+  }
 }
 
 log_message("Run complete.")

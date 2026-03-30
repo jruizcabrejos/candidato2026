@@ -26,7 +26,7 @@ REQUIRED_PACKAGES <- c(
   "tibble"
 )
 
-HEADLESS <- TRUE
+HEADLESS <- FALSE
 PROFILE_LOAD_TIMEOUT <- 15
 IMAGE_LOAD_TIMEOUT <- 20
 PROFILE_POLL_INTERVAL <- 0.5
@@ -158,22 +158,28 @@ build_fallback_listing_row <- function(id_candidato) {
     NA_character_
   }
 
-  tibble::tibble(
-    card_index = NA_character_,
-    codigo_distrito_electoral = NA_character_,
-    distrito_electoral = NA_character_,
+  build_listing_row(
+    card_index = NA_integer_,
+    district_row = tibble::tibble(
+      codigo_distrito_electoral = NA_character_,
+      distrito_electoral = NA_character_
+    ),
     numero_postulacion = NA_character_,
     nombre = NA_character_,
     dni_listado = dni,
     partido_politico = NA_character_,
+    cargo_postula = NA_character_,
+    type = NA_character_,
     estado_inadmisible = NA_character_,
     url_imagen = NA_character_,
     url_logo_partido = NA_character_,
     url_hoja_vida = url_hoja_vida,
-    card_html = NA_character_,
-    partido_id = partido_id,
-    id_candidato = coalesce_chr(id_candidato)
-  )
+    card_html = NA_character_
+  ) %>%
+    dplyr::mutate(
+      partido_id = partido_id,
+      id_candidato = coalesce_chr(id_candidato)
+    )
 }
 
 
@@ -201,24 +207,66 @@ if (length(profile_files) == 0) {
 
 listing_rows <- purrr::map_dfr(listing_files, function(path) {
   listing_df <- read_csv_chr(path)
+  listing_name <- basename(path)
 
   if (is.null(listing_df) || nrow(listing_df) == 0) {
     return(tibble::tibble())
   }
 
+  if (!"cargo_postula" %in% names(listing_df)) {
+    listing_df$cargo_postula <- NA_character_
+  }
+
+  if (!"type" %in% names(listing_df)) {
+    listing_df$type <- NA_character_
+  }
+
+  if (!"target_slug" %in% names(listing_df)) {
+    listing_df$target_slug <- NA_character_
+  }
+
   listing_df %>%
     dplyr::mutate(
+      target_slug = dplyr::coalesce(
+        .data$target_slug,
+        dplyr::case_when(
+          grepl("^senadores_", .env$listing_name) ~ "senadores",
+          grepl("^presidente-vicepresidentes_", .env$listing_name) ~ "presidente-vicepresidentes",
+          TRUE ~ "diputados"
+        )
+      ),
+      type = dplyr::coalesce(
+        .data$type,
+        dplyr::case_when(
+          grepl("^senadores_", .env$listing_name) ~ "Senador",
+          grepl("^presidente-vicepresidentes_", .env$listing_name) ~ NA_character_,
+          TRUE ~ "Diputado"
+        )
+      ),
+      cargo_postula = dplyr::coalesce(
+        .data$cargo_postula,
+        dplyr::case_when(
+          grepl("^senadores_", .env$listing_name) ~ "SENADOR",
+          TRUE ~ "DIPUTADO"
+        )
+      ),
       partido_id = purrr::map_chr(.data$url_logo_partido, extract_party_id_from_logo_url),
-      id_candidato = purrr::map_chr(.data$url_hoja_vida, ~ derive_candidate_ids(.x)$id_candidato)
+      id_candidato = purrr::pmap_chr(
+        list(.data$url_hoja_vida, .data$type),
+        function(url_hoja_vida, type_value) {
+          derive_candidate_ids(url_hoja_vida, type = type_value)$id_candidato
+        }
+      )
     )
 })
 
 district_lookup <- if (nrow(listing_rows) > 0) {
   listing_rows %>%
-    dplyr::distinct(.data$codigo_distrito_electoral, .data$distrito_electoral) %>%
+    dplyr::distinct(.data$target_slug, .data$codigo_distrito_electoral, .data$distrito_electoral) %>%
     dplyr::filter(!is.na(.data$codigo_distrito_electoral) | !is.na(.data$distrito_electoral))
 } else {
   tibble::tibble(
+    target_slug = character(),
     codigo_distrito_electoral = character(),
     distrito_electoral = character()
   )
@@ -265,6 +313,7 @@ for (profile_idx in seq_along(profile_files)) {
   }
 
   district_row <- tibble::tibble(
+    target_slug = row_value_or_na(listing_row, "target_slug"),
     codigo_distrito_electoral = row_value_or_na(listing_row, "codigo_distrito_electoral"),
     distrito_electoral = row_value_or_na(listing_row, "distrito_electoral")
   )

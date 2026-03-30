@@ -24,7 +24,7 @@ FIRST_NAME_LOOKUP_CSV <- file.path("data", "reference", "first_name_sex.csv")
 SEX_OVERRIDE_CSV <- file.path("data", "manual", "sex_overrides.csv")
 
 BLEND_MODES <- c("filtered", "all_faces")
-GROUP_MODES <- c("all", "sex", "region", "region_sex", "affiliation", "region_affiliation")
+GROUP_MODES <- c("all", "sex", "region", "region_sex", "affiliation", "affiliation_sex", "region_affiliation")
 
 MIN_VALID_IMAGES <- 3L
 TARGET_WIDTH <- 427L
@@ -177,24 +177,36 @@ sex_display_label <- function(x) {
   NA_character_
 }
 
-derive_candidate_id_from_file <- function(file_name) {
+image_file_parts <- function(file_name) {
   parts <- strsplit(tools::file_path_sans_ext(basename(file_name)), "_", fixed = TRUE)[[1]]
+  known_type_tokens <- c("diputado", "senador", "presidente", "vicepresidente")
+  id_length <- if (length(parts) >= 3 && parts[3] %in% known_type_tokens) 3L else if (length(parts) >= 2) 2L else NA_integer_
 
-  if (length(parts) < 2) {
+  list(parts = parts, id_length = id_length)
+}
+
+derive_candidate_id_from_file <- function(file_name) {
+  parsed <- image_file_parts(file_name)
+  parts <- parsed$parts
+  id_length <- parsed$id_length
+
+  if (is.na(id_length)) {
     return(NA_character_)
   }
 
-  paste(parts[1:2], collapse = "_")
+  paste(parts[seq_len(id_length)], collapse = "_")
 }
 
 derive_candidate_name_from_file <- function(file_name) {
-  parts <- strsplit(tools::file_path_sans_ext(basename(file_name)), "_", fixed = TRUE)[[1]]
+  parsed <- image_file_parts(file_name)
+  parts <- parsed$parts
+  id_length <- parsed$id_length
 
-  if (length(parts) <= 2) {
+  if (is.na(id_length) || length(parts) <= id_length) {
     return(NA_character_)
   }
 
-  label_from_slug(paste(parts[-c(1, 2)], collapse = "-"))
+  label_from_slug(paste(parts[-seq_len(id_length)], collapse = "-"))
 }
 
 empty_candidate_metadata <- function() {
@@ -1136,6 +1148,7 @@ group_mode_fields <- function(group_mode) {
     region = c("region_slug"),
     region_sex = c("region_slug", "sex_assigned"),
     affiliation = c("affiliation_slug"),
+    affiliation_sex = c("affiliation_slug", "sex_assigned"),
     region_affiliation = c("region_slug", "affiliation_slug"),
     stop("Unsupported grouping mode: ", group_mode, call. = FALSE)
   )
@@ -1191,6 +1204,13 @@ build_group_paths <- function(blend_mode, group_mode, region_slug = NA_character
     ))
   }
 
+  if (identical(group_mode, "affiliation_sex")) {
+    return(list(
+      output_path = file.path(root_dir, "by_affiliation_sex", affiliation_slug, paste0(sex_assigned, ".jpg")),
+      qc_path = file.path(root_dir, "qc", "by_affiliation_sex", affiliation_slug, paste0(sex_assigned, ".jpg"))
+    ))
+  }
+
   list(
     output_path = file.path(
       root_dir,
@@ -1224,6 +1244,7 @@ build_group_record <- function(group_rows, blend_mode, group_mode) {
     region = region_slug,
     region_sex = paste(region_slug, sex_assigned, sep = "__"),
     affiliation = affiliation_slug,
+    affiliation_sex = paste(affiliation_slug, sex_assigned, sep = "__"),
     region_affiliation = paste(region_slug, affiliation_slug, sep = "__")
   )
 
@@ -1234,6 +1255,7 @@ build_group_record <- function(group_rows, blend_mode, group_mode) {
     region = region_label,
     region_sex = paste(region_label, sex_display_label(sex_assigned), sep = " / "),
     affiliation = affiliation_label,
+    affiliation_sex = paste(affiliation_label, sex_display_label(sex_assigned), sep = " / "),
     region_affiliation = paste(region_label, affiliation_label, sep = " / ")
   )
 
@@ -1258,6 +1280,7 @@ reset_generated_output_dirs <- function() {
     # Remove compatibility folders from earlier runs and do not recreate them.
     file.path(OUTPUT_ROOT, "by_region"),
     file.path(OUTPUT_ROOT, "by_affiliation"),
+    file.path(OUTPUT_ROOT, "by_affiliation_sex"),
     file.path(OUTPUT_ROOT, "by_region_affiliation"),
     file.path(OUTPUT_ROOT, "qc")
   )
@@ -1280,23 +1303,27 @@ ensure_average_face_dirs <- function() {
     file.path(FILTERED_ROOT, "by_region"),
     file.path(FILTERED_ROOT, "by_region_sex"),
     file.path(FILTERED_ROOT, "by_affiliation"),
+    file.path(FILTERED_ROOT, "by_affiliation_sex"),
     file.path(FILTERED_ROOT, "by_region_affiliation"),
     file.path(FILTERED_ROOT, "by_sex"),
     file.path(FILTERED_ROOT, "qc"),
     file.path(FILTERED_ROOT, "qc", "by_region"),
     file.path(FILTERED_ROOT, "qc", "by_region_sex"),
     file.path(FILTERED_ROOT, "qc", "by_affiliation"),
+    file.path(FILTERED_ROOT, "qc", "by_affiliation_sex"),
     file.path(FILTERED_ROOT, "qc", "by_region_affiliation"),
     file.path(FILTERED_ROOT, "qc", "by_sex"),
     file.path(ALL_FACES_ROOT, "by_region"),
     file.path(ALL_FACES_ROOT, "by_region_sex"),
     file.path(ALL_FACES_ROOT, "by_affiliation"),
+    file.path(ALL_FACES_ROOT, "by_affiliation_sex"),
     file.path(ALL_FACES_ROOT, "by_region_affiliation"),
     file.path(ALL_FACES_ROOT, "by_sex"),
     file.path(ALL_FACES_ROOT, "qc"),
     file.path(ALL_FACES_ROOT, "qc", "by_region"),
     file.path(ALL_FACES_ROOT, "qc", "by_region_sex"),
     file.path(ALL_FACES_ROOT, "qc", "by_affiliation"),
+    file.path(ALL_FACES_ROOT, "qc", "by_affiliation_sex"),
     file.path(ALL_FACES_ROOT, "qc", "by_region_affiliation"),
     file.path(ALL_FACES_ROOT, "qc", "by_sex"),
     file.path("data", "reference"),
