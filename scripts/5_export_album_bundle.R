@@ -3,7 +3,7 @@
 # Script: 5_export_album_bundle.R - Export album handoff bundle from processed data
 # Author: Jorge Ruiz-Cabrejos and Inca Slop
 # Created: 2026-03-26
-# Last Updated: 2026-03-26
+# Last Updated: 2026-04-02
 ######################################################################################
 
 #~#~#~#~#~#~#~#~#~#~#~#~#~#~#
@@ -41,6 +41,12 @@ WEBP_QUALITY <- suppressWarnings(
 if (length(WEBP_QUALITY) == 0L || is.na(WEBP_QUALITY) || WEBP_QUALITY < 1L || WEBP_QUALITY > 100L) {
   WEBP_QUALITY <- 90L
 }
+
+WEBP_MAX_BYTES <- 15L * 1024L
+WEBP_MIN_QUALITY <- 1L
+PORTRAIT_TARGET_WIDTH <- 427L
+PORTRAIT_TARGET_HEIGHT <- 602L
+PORTRAIT_UPPER_CENTER_BIAS <- 0.15
 
 QC_EXPORT_COLUMNS <- c(
   "processing_status",
@@ -411,6 +417,311 @@ build_qc_lookup <- function(path) {
   list(data = qc_lookup, available = TRUE)
 }
 
+sanitize_webp_quality <- function(quality) {
+  quality <- suppressWarnings(as.integer(quality))
+
+  if (length(quality) == 0L || is.na(quality)) {
+    return(WEBP_QUALITY)
+  }
+
+  max(WEBP_MIN_QUALITY, min(100L, quality[[1]]))
+}
+
+file_size_bytes <- function(path) {
+  file_info <- suppressWarnings(file.info(path))
+
+  if (is.null(file_info) || nrow(file_info) == 0L) {
+    return(NA_real_)
+  }
+
+  as.numeric(file_info$size[[1]])
+}
+
+compute_portrait_prior_crop <- function(
+  image_width,
+  image_height,
+  target_width = PORTRAIT_TARGET_WIDTH,
+  target_height = PORTRAIT_TARGET_HEIGHT
+) {
+  target_ratio <- target_width / target_height
+  image_width <- as.integer(image_width)
+  image_height <- as.integer(image_height)
+
+  crop_width <- image_width
+  crop_height <- as.integer(round(crop_width / target_ratio))
+
+  if (crop_height > image_height) {
+    crop_height <- image_height
+    crop_width <- as.integer(round(crop_height * target_ratio))
+  }
+
+  crop_width <- max(1L, min(crop_width, image_width))
+  crop_height <- max(1L, min(crop_height, image_height))
+
+  crop_left <- as.integer(floor((image_width - crop_width) / 2))
+  crop_top <- as.integer(floor((image_height - crop_height) * PORTRAIT_UPPER_CENTER_BIAS))
+  crop_top <- max(0L, min(crop_top, image_height - crop_height))
+
+  list(
+    crop_width = crop_width,
+    crop_height = crop_height,
+    crop_left = crop_left,
+    crop_top = crop_top
+  )
+}
+
+normalize_webp_portrait <- function(source_path) {
+  image <- magick::image_read(source_path)
+  image <- magick::image_orient(image)
+
+  image_info <- magick::image_info(image)
+
+  if (nrow(image_info) == 0L || is.na(image_info$width[[1]]) || is.na(image_info$height[[1]])) {
+    abort_export(paste("Could not inspect portrait dimensions for:", source_path))
+  }
+
+  crop_spec <- compute_portrait_prior_crop(
+    image_width = image_info$width[[1]],
+    image_height = image_info$height[[1]]
+  )
+
+  image <- magick::image_crop(
+    image,
+    geometry = sprintf(
+      "%dx%d+%d+%d",
+      crop_spec$crop_width,
+      crop_spec$crop_height,
+      crop_spec$crop_left,
+      crop_spec$crop_top
+    )
+  )
+
+  magick::image_strip(image)
+}
+
+image_dimensions <- function(image) {
+  image_info <- magick::image_info(image)
+
+  if (nrow(image_info) == 0L || is.na(image_info$width[[1]]) || is.na(image_info$height[[1]])) {
+    abort_export("Could not inspect in-memory image dimensions.")
+  }
+
+  list(
+    width = as.integer(image_info$width[[1]]),
+    height = as.integer(image_info$height[[1]])
+  )
+}
+
+resize_webp_fallback_image <- function(image, scale) {
+  scale <- suppressWarnings(as.numeric(scale))
+
+  if (length(scale) == 0L || is.na(scale)) {
+    return(image)
+  }
+
+  scale <- max(0.05, min(1, scale[[1]]))
+
+  if (scale >= 0.999) {
+    return(image)
+  }
+
+  dims <- image_dimensions(image)
+  resized_width <- max(1L, as.integer(round(dims$width * scale)))
+  resized_height <- max(1L, as.integer(round(dims$height * scale)))
+
+  magick::image_resize(
+    image,
+    geometry = sprintf("%dx%d!", resized_width, resized_height)
+  )
+}
+
+write_webp_candidate <- function(image, path, quality) {
+  if (file.exists(path)) {
+    unlink(path, force = TRUE)
+  }
+
+  magick::image_write(
+    image,
+    path = path,
+    format = "webp",
+    quality = sanitize_webp_quality(quality)
+  )
+
+  file_size_bytes(path)
+}
+
+fit_webp_candidate <- function(image, quality = WEBP_QUALITY, max_bytes = WEBP_MAX_BYTES, temp_path, best_path) {
+  target_quality <- sanitize_webp_quality(quality)
+  dims <- image_dimensions(image)
+
+  if (file.exists(best_path)) {
+    unlink(best_path, force = TRUE)
+  }
+
+  best_quality <- NA_integer_
+  best_size <- NA_real_
+
+  persist_candidate <- function(candidate_quality, candidate_size) {
+    file.copy(temp_path, best_path, overwrite = TRUE)
+    best_quality <<- candidate_quality
+    best_size <<- candidate_size
+  }
+
+  initial_size <- write_webp_candidate(image, temp_path, target_quality)
+
+  if (!is.na(initial_size) && initial_size <= max_bytes) {
+    persist_candidate(target_quality, initial_size)
+  } else {
+    low <- WEBP_MIN_QUALITY
+    high <- max(WEBP_MIN_QUALITY, target_quality - 1L)
+
+    while (low <= high) {
+      candidate_quality <- as.integer(floor((low + high) / 2))
+      candidate_size <- write_webp_candidate(image, temp_path, candidate_quality)
+
+      if (is.na(candidate_size)) {
+        break
+      }
+
+      if (candidate_size <= max_bytes) {
+        persist_candidate(candidate_quality, candidate_size)
+        low <- candidate_quality + 1L
+      } else {
+        high <- candidate_quality - 1L
+      }
+    }
+  }
+
+  if (is.na(best_quality)) {
+    fallback_size <- write_webp_candidate(image, temp_path, WEBP_MIN_QUALITY)
+
+    return(list(
+      within_limit = isTRUE(!is.na(fallback_size) && fallback_size <= max_bytes),
+      size_bytes = fallback_size,
+      quality = WEBP_MIN_QUALITY,
+      width = dims$width,
+      height = dims$height
+    ))
+  }
+
+  list(
+    within_limit = TRUE,
+    size_bytes = best_size,
+    quality = best_quality,
+    width = dims$width,
+    height = dims$height
+  )
+}
+
+write_webp_with_size_limit <- function(image, dest_path, quality = WEBP_QUALITY, max_bytes = WEBP_MAX_BYTES) {
+  temp_path <- tempfile(fileext = ".webp")
+  best_path <- tempfile(fileext = ".webp")
+  final_path <- tempfile(fileext = ".webp")
+
+  on.exit(unlink(c(temp_path, best_path, final_path), force = TRUE), add = TRUE)
+
+  primary_attempt <- fit_webp_candidate(
+    image = image,
+    quality = quality,
+    max_bytes = max_bytes,
+    temp_path = temp_path,
+    best_path = best_path
+  )
+
+  final_attempt <- primary_attempt
+  final_scale <- 1
+  used_resize_fallback <- FALSE
+
+  if (isTRUE(primary_attempt$within_limit) && file.exists(best_path)) {
+    file.copy(best_path, final_path, overwrite = TRUE)
+  }
+
+  if (!isTRUE(primary_attempt$within_limit)) {
+    coarse_scales <- c(seq(0.95, 0.20, by = -0.05), 0.15, 0.10)
+    last_failed_scale <- 1
+    successful_scale <- NA_real_
+    successful_attempt <- NULL
+
+    for (scale in coarse_scales) {
+      resized_image <- resize_webp_fallback_image(image, scale)
+      attempt <- fit_webp_candidate(
+        image = resized_image,
+        quality = quality,
+        max_bytes = max_bytes,
+        temp_path = temp_path,
+        best_path = best_path
+      )
+
+      if (isTRUE(attempt$within_limit)) {
+        successful_scale <- scale
+        successful_attempt <- attempt
+        file.copy(best_path, final_path, overwrite = TRUE)
+        break
+      }
+
+      last_failed_scale <- scale
+      final_attempt <- attempt
+    }
+
+    if (!is.null(successful_attempt)) {
+      used_resize_fallback <- TRUE
+      final_attempt <- successful_attempt
+      final_scale <- successful_scale
+
+      refine_start <- round(last_failed_scale - 0.01, 2)
+      refine_end <- round(successful_scale + 0.01, 2)
+
+      if (refine_start >= refine_end) {
+        refine_scales <- seq(from = refine_start, to = refine_end, by = -0.01)
+
+        for (scale in refine_scales) {
+          resized_image <- resize_webp_fallback_image(image, scale)
+          attempt <- fit_webp_candidate(
+            image = resized_image,
+            quality = quality,
+            max_bytes = max_bytes,
+            temp_path = temp_path,
+            best_path = best_path
+          )
+
+          if (isTRUE(attempt$within_limit)) {
+            final_attempt <- attempt
+            final_scale <- scale
+            file.copy(best_path, final_path, overwrite = TRUE)
+            break
+          }
+        }
+      }
+    }
+  }
+
+  if (!isTRUE(final_attempt$within_limit) || !file.exists(final_path)) {
+    return(list(
+      success = FALSE,
+      within_limit = FALSE,
+      size_bytes = final_attempt$size_bytes,
+      quality = final_attempt$quality,
+      width = final_attempt$width,
+      height = final_attempt$height,
+      scale = final_scale,
+      used_resize_fallback = used_resize_fallback
+    ))
+  }
+
+  success <- file.copy(final_path, dest_path, overwrite = TRUE)
+
+  list(
+    success = isTRUE(success) && file.exists(dest_path),
+    within_limit = TRUE,
+    size_bytes = final_attempt$size_bytes,
+    quality = final_attempt$quality,
+    width = final_attempt$width,
+    height = final_attempt$height,
+    scale = final_scale,
+    used_resize_fallback = used_resize_fallback
+  )
+}
+
 write_export_asset <- function(source_path, dest_path, asset_format = "jpg", quality = NA_integer_) {
   dir.create(dirname(dest_path), recursive = TRUE, showWarnings = FALSE)
 
@@ -420,18 +731,50 @@ write_export_asset <- function(source_path, dest_path, asset_format = "jpg", qua
   }
 
   if (identical(asset_format, "webp")) {
-    success <- tryCatch({
-      image <- magick::image_read(source_path)
-      magick::image_write(
-        image,
-        path = dest_path,
-        format = "webp",
-        quality = quality
-      )
-      file.exists(dest_path)
-    }, error = function(e) FALSE)
+    image <- tryCatch(
+      normalize_webp_portrait(source_path),
+      error = function(e) {
+        abort_export(paste(
+          "Failed to normalize portrait for WebP export:",
+          source_path,
+          "-",
+          trimws(gsub("[\r\n]+", " ", conditionMessage(e)))
+        ))
+      }
+    )
 
-    return(isTRUE(success))
+    result <- tryCatch(
+      write_webp_with_size_limit(
+        image = image,
+        dest_path = dest_path,
+        quality = quality,
+        max_bytes = WEBP_MAX_BYTES
+      ),
+      error = function(e) {
+        abort_export(paste(
+          "Failed to write WebP portrait asset:",
+          source_path,
+          "-",
+          trimws(gsub("[\r\n]+", " ", conditionMessage(e)))
+        ))
+      }
+    )
+
+    if (!isTRUE(result$success)) {
+      return(FALSE)
+    }
+
+    if (!isTRUE(result$within_limit)) {
+      abort_export(
+        paste(
+          "Could not compress portrait to 15 KB or less after portrait-prior cropping to the 427x602 ratio, even with fallback resize:",
+          source_path,
+          paste0("(quality=", result$quality, ", bytes=", as.integer(round(result$size_bytes)), ")")
+        )
+      )
+    }
+
+    return(TRUE)
   }
 
   abort_export(paste("Unsupported export asset format:", asset_format))
