@@ -52,4 +52,4 @@ Toda la información se alimenta de datos públicos. Las páginas principales co
 
 Se recomienda la siguiente atribución al publicar resultados derivados de este proyecto:
 
-> *Fuente: Jurado Nacional de Elecciones (JNE), Voto Informado - Diputados, https://votoinformado.jne.gob.pe/diputados*
+> *Fuente: Jurado Nacional de Elecciones (JNE), Voto Informado, https://votoinformado.jne.gob.pe/*
